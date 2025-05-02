@@ -1,0 +1,270 @@
+# --- 1. Load Libraries & Setup ---
+# Ensure required packages are installed
+# install.packages(c("Seurat", "hdWGCNA", "tidyverse", "cowplot", "patchwork"))
+library(Seurat)
+library(hdWGCNA)
+library(WGCNA)          # Load WGCNA after hdWGCNA
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+
+# Set theme and seed (optional, but good practice)
+theme_set(theme_cowplot())
+set.seed(12345)
+
+# --- 2. Define Parameters ---
+
+# !!! --- Parameters to MODIFY --- !!!
+
+# Path to the saved Seurat object containing the results from the initial multi-celltype WGCNA run
+input_rds_file <- "hdWGCNA_MultiCelltype_Final.rds" # !!! <--- MODIFY HERE: Path to your saved RDS file
+
+# Define the list of cell types EXACTLY as they were analyzed in the previous script
+# These names will be used to find the corresponding WGCNA results in the loaded object
+list_of_celltypes_analyzed <- c("Venous_RAPGEF3+_Cells", "Arterial_Endo_RAPGEF3+SELP+", "Venous_Endo_RAPGEF3+SELP-","Arterial_RAPGEF3+_Cells") # !!! <--- MODIFY HERE: Must match previous run
+
+# Column name in metadata used for cell type grouping in the previous WGCNA run
+group_by_column_wgcna <- "new_celltype" # !!! <--- MODIFY HERE: Must match previous run
+
+# Module Preservation Parameters
+# We let hdWGCNA use its default nPermutations (usually 100 or 200)
+# by omitting the argument in the ModulePreservation call below.
+# If you need to override the default, you might need to investigate hdWGCNA/WGCNA versions
+# or contact hdWGCNA developers about the argument passing issue.
+# preservation_n_permutations <- 200
+
+# Output directory for preservation plots
+output_plot_dir <- "WGCNA_Preservation_Plots"
+
+# Plot Dimensions
+pres_plot_width <- 10
+pres_plot_height <- 5
+
+# !!! --- End of parameters to modify --- !!!
+
+# --- 3. Load Data & Validate ---
+
+# Create output directory
+if (!dir.exists(output_plot_dir)) {
+  dir.create(output_plot_dir)
+  message("Created directory for saving plots: ", output_plot_dir)
+} else {
+  message("Output directory for plots already exists: ", output_plot_dir)
+}
+
+# Load the Seurat object
+if (!file.exists(input_rds_file)) {
+  stop("Input RDS file not found: ", input_rds_file)
+}
+message("Loading Seurat object from: ", input_rds_file)
+seurat_obj <- readRDS(input_rds_file)
+message("Seurat object loaded successfully.")
+
+# Validate that the specified cell types exist in the object's metadata
+# Ensure the grouping column exists
+if (!group_by_column_wgcna %in% colnames(seurat_obj@meta.data)) {
+    stop("Grouping column '", group_by_column_wgcna, "' not found in Seurat object metadata.")
+}
+all_celltypes_in_data <- unique(as.character(seurat_obj@meta.data[[group_by_column_wgcna]]))
+missing_cts <- list_of_celltypes_analyzed[!list_of_celltypes_analyzed %in% all_celltypes_in_data]
+if(length(missing_cts) > 0){
+  warning("The following cell types specified were not found in the loaded object's '", group_by_column_wgcna, "' column: ", paste(missing_cts, collapse=", "))
+  # Decide whether to stop or continue with available ones
+  list_of_celltypes_analyzed <- intersect(list_of_celltypes_analyzed, all_celltypes_in_data)
+  if(length(list_of_celltypes_analyzed) == 0){
+    stop("No valid cell types remaining for analysis based on loaded object.")
+  }
+}
+
+# Check if at least two cell types remain for comparison
+if(length(list_of_celltypes_analyzed) < 2){
+    stop("Module preservation requires at least two cell types to compare. Only ", length(list_of_celltypes_analyzed), " valid cell type(s) found.")
+}
+
+# Reconstruct the expected wgcna_name for each cell type and check if results exist
+valid_wgcna_runs <- list()
+message("Checking for WGCNA results in the loaded object...")
+for(cell_type in list_of_celltypes_analyzed){
+    # Recreate the safe name and wgcna_name exactly as in the original script
+    # Ensure consistency in cleaning rules if special characters were handled differently
+    safe_cell_type_name <- gsub("[^A-Za-z0-9_]", "_", cell_type) # Use the same cleaning rule as original script
+    wgcna_name_expected <- paste0("WGCNA_", safe_cell_type_name)
+
+    # Check if this wgcna_name exists in the misc slot
+    if(wgcna_name_expected %in% names(seurat_obj@misc)){
+        # Perform basic checks for necessary components (e.g., modules, expression data)
+        modules_exist <- !is.null(tryCatch(GetModules(seurat_obj, wgcna_name = wgcna_name_expected), error = function(e) NULL))
+        expr_exist <- !is.null(tryCatch(GetDatExpr(seurat_obj, wgcna_name = wgcna_name_expected), error = function(e) NULL))
+
+        if(modules_exist && expr_exist){
+            message("  Found valid WGCNA results for: ", cell_type, " (", wgcna_name_expected, ")")
+            valid_wgcna_runs[[cell_type]] <- wgcna_name_expected
+        } else {
+            warning("WGCNA results slot '", wgcna_name_expected, "' found for '", cell_type, "', but required components (modules/expression) seem missing or failed to retrieve. Skipping this cell type.")
+        }
+    } else {
+        warning("Expected WGCNA results slot '", wgcna_name_expected, "' not found for cell type '", cell_type, "'. Skipping this cell type.")
+    }
+}
+
+# Check again if enough valid runs exist after verification
+if (length(valid_wgcna_runs) < 2) {
+    stop("Fewer than two WGCNA runs with valid results were found in the loaded object. Cannot perform preservation analysis.")
+} else {
+     message("Found valid WGCNA results for ", length(valid_wgcna_runs), " cell types. Proceeding with preservation analysis.")
+}
+
+
+# --- 4. Module Preservation Analysis ---
+
+message("\n\n==========================================================")
+message("Starting Module Preservation Analysis")
+message("==========================================================\n")
+
+preservation_results <- list() # Store preservation results metadata
+
+# Loop through each cell type as the reference
+for (ref_cell_type in names(valid_wgcna_runs)) {
+    ref_wgcna_name <- valid_wgcna_runs[[ref_cell_type]]
+    safe_ref_name <- gsub("[^A-Za-z0-9_.-]", "_", ref_cell_type) # Allow . and - in safe names if needed
+
+    message("\n--- Analyzing Preservation of Modules from: ", ref_cell_type, " (", ref_wgcna_name, ") ---")
+
+    # Loop through each other cell type as the query
+    for (query_cell_type in names(valid_wgcna_runs)) {
+        if (ref_cell_type == query_cell_type) next # Don't compare a cell type to itself
+
+        query_wgcna_name <- valid_wgcna_runs[[query_cell_type]]
+        safe_query_name <- gsub("[^A-Za-z0-9_.-]", "_", query_cell_type)
+        preservation_run_name <- paste0("Preserve_", safe_ref_name, "_vs_", safe_query_name)
+
+        message("  Comparing against query: ", query_cell_type, " (", query_wgcna_name, ")")
+
+        # Data checks (already partially done, but double-check here)
+         ref_modules <- GetModules(seurat_obj, wgcna_name=ref_wgcna_name)
+         if(is.null(ref_modules) || nrow(ref_modules) == 0){
+             warning("No modules found for reference '", ref_cell_type, "' (", ref_wgcna_name, ") just before ModulePreservation call. Skipping comparison against ", query_cell_type)
+             next
+         }
+         query_expr <- GetDatExpr(seurat_obj, wgcna_name=query_wgcna_name)
+         if(is.null(query_expr) || ncol(query_expr) == 0 || nrow(query_expr) == 0){
+              warning("Expression data not found or empty for query '", query_cell_type, "' (", query_wgcna_name, ") just before ModulePreservation call. Skipping comparison.")
+              next
+         }
+
+        # --- Run ModulePreservation WITH tryCatch re-introduced ---
+        # --- REMOVED nPermutations argument ---
+        tryCatch({
+            message("    Calling ModulePreservation (verbose=3)...") # Added message
+            seurat_obj <- ModulePreservation(
+              seurat_obj,
+              seurat_ref = seurat_obj,
+              wgcna_name = query_wgcna_name,
+              wgcna_name_ref = ref_wgcna_name,
+              name = preservation_run_name,
+              verbose = 3
+              # nPermutations = preservation_n_permutations # <-- REMOVED/COMMENTED OUT
+            )
+            message("    ModulePreservation call completed.") # Added message
+
+            # Store the name of the successful preservation run for plotting later
+            # (This part will only be reached if ModulePreservation succeeds)
+            preservation_results[[preservation_run_name]] <- list(
+                ref = ref_cell_type,
+                query = query_cell_type,
+                ref_wgcna = ref_wgcna_name,
+                query_wgcna = query_wgcna_name
+            )
+            message("  Successfully ran ModulePreservation, results stored as '", preservation_run_name, "'")
+
+        }, error = function(e) {
+            # Report error if ModulePreservation fails
+            warning("ModulePreservation failed for reference '", ref_cell_type, "' vs query '", query_cell_type, "': ", e$message)
+            # Clean up potentially partially stored result if needed (optional)
+             if(query_wgcna_name %in% names(seurat_obj@misc) &&
+                "preservation" %in% names(seurat_obj@misc[[query_wgcna_name]]) &&
+                 preservation_run_name %in% names(seurat_obj@misc[[query_wgcna_name]]$preservation)){
+                 seurat_obj@misc[[query_wgcna_name]]$preservation[[preservation_run_name]] <- NULL
+                 message("  Cleaned up potentially partial preservation results for failed run.")
+             }
+        }) # End tryCatch for ModulePreservation
+
+
+    } # End inner loop (query cell types)
+} # End outer loop (reference cell types)
+
+# --- 5. Visualize Preservation Results ---
+message("\n--- Plotting Module Preservation Results ---")
+
+# --- Plotting loop with tryCatch ---
+if (length(preservation_results) > 0) {
+    for (pres_name in names(preservation_results)) {
+        ref_info <- preservation_results[[pres_name]]$ref
+        query_info <- preservation_results[[pres_name]]$query
+        query_wgcna_context <- preservation_results[[pres_name]]$query_wgcna # Need query context for plotting
+
+        message("  Plotting preservation: ", pres_name, " (Ref: ", ref_info, ", Query: ", query_info, ")")
+
+        tryCatch({ # Add tryCatch back for plotting robustness
+            # Plot the Z-summary statistics
+            plot_list_pres <- PlotModulePreservation(
+              seurat_obj,
+              name = pres_name,
+              statistics = "summary",
+              wgcna_name = query_wgcna_context
+            )
+
+            if (!is.null(plot_list_pres) && length(plot_list_pres) > 0) {
+                pres_plot_obj <- wrap_plots(plot_list_pres, ncol = 2) +
+                  plot_annotation(title = paste("Module Preservation:", ref_info, "(Ref) vs", query_info, "(Query)"))
+
+                # Save the plot
+                pres_filename <- file.path(output_plot_dir, paste0(pres_name, "_Zsummary.pdf"))
+                ggsave(
+                  filename = pres_filename,
+                  plot = pres_plot_obj,
+                  width = pres_plot_width,
+                  height = pres_plot_height,
+                  units = "in",
+                  device = 'pdf'
+                )
+                message("    Saved Z-summary preservation plot to: ", pres_filename)
+            } else {
+                warning("PlotModulePreservation did not generate plots for ", pres_name, ". Skipping plot saving.")
+            }
+
+        }, error = function(e) {
+            warning("Plotting preservation results failed for '", pres_name, "': ", e$message)
+        }) # End tryCatch for plotting
+    } # End loop plotting results
+} else {
+    message("  No successful module preservation runs were completed to plot.")
+}
+
+
+# --- 6. Final Steps ---
+message("\n\n==========================================================")
+message("Module Preservation analysis complete.")
+message("Plots saved in directory: '", output_plot_dir, "'")
+
+# List preservation results computed
+if(exists("preservation_results") && length(preservation_results) > 0){
+    message("Preservation results computed for comparisons like '", paste(names(preservation_results), collapse="', '"), "'.")
+    message("These results are stored within the Seurat object.")
+    message("Use GetModulePreservation(seurat_obj, name='Preserve_Ref_vs_Query', wgcna_name='WGCNA_Query') to access tables.")
+} else {
+    message("No preservation analysis results were generated or successfully completed.")
+}
+
+
+# Optional: Save the Seurat object again with the added preservation results
+# final_rds_file_with_preservation <- "hdWGCNA_MultiCelltype_with_Preservation.rds"
+# tryCatch({
+#     saveRDS(seurat_obj, file = final_rds_file_with_preservation)
+#     message("Final Seurat object with preservation results saved to: ", final_rds_file_with_preservation)
+# }, error = function(e){
+#     warning("Failed to save the final Seurat object with preservation results: ", e$message)
+# })
+
+
+message("\nScript finished.")

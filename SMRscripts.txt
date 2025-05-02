@@ -1,0 +1,159 @@
+#################转换数据####################
+setwd('E:\\Items\\yuanjiaqi\\Endometriosis\\GWAS_Data')
+library(FastGWASR)
+trace('.checkAccess_fun.default',edit = T,where = asNamespace('Fast2TWAS'))
+library(Fast2TWAS)
+batch_download_ieu('ebi-a-GCST90018839')
+dat=vroom::vroom('summary_stats_finngen_R5_N14_ENDOMETRIOSIS.gz')
+
+format_dat=gwas2format(
+  gwas_dat = dat,
+  chr_col = '#chrom',
+  pos_col = 'pos',
+  snp_col = 'rsids',
+  effect_allele_col = 'alt',
+  other_allele_col = 'ref',
+  eaf_col = 'maf',
+  beta_col = 'beta',
+  se_col = 'sebeta',
+  pval_col = 'pval'
+)
+format_dat$samplesize=77257
+vroom::vroom_write(format_dat,'finn-b-N14_ENDOMETRIOSIS.gz')
+convert_to_ma('finn-b-N14_ENDOMETRIOSIS.gz')
+
+
+GCST90018839_dat=vroom::vroom('34594039-GCST90018839-EFO_0001065-Build37.f.tsv.gz')
+head(GCST90018839_dat)
+format_GCST90018839_dat=gwas2format(
+  gwas_dat = GCST90018839_dat,
+  chr_col = 'chromosome',
+  pos_col = 'base_pair_location',
+  snp_col = 'rsids',
+  effect_allele_col = 'effect_allele',
+  other_allele_col = 'other_allele',
+  eaf_col = 'effect_allele_frequency',
+  beta_col = 'beta',
+  se_col = 'standard_error',
+  pval_col = 'p_value'
+)
+format_GCST90018839_dat<-dplyr::select(GCST90018839_dat,chromosome,base_pair_location,other_allele,effect_allele,beta,standard_error,p_value)%>%
+  dplyr::rename(CHR='chromosome',BP='base_pair_location',A1='other_allele',A2='effect_allele',BETA='beta',SE='standard_error',P='p_value')
+
+format_GCST90018839_dat_addSNP<-format_sumstats(format_GCST90018839_dat,ref_genome = 'GRCh37')
+
+setwd('G:\\')
+GCST90018839_dat=vroom::vroom('34594039-GCST90018839-EFO_0001065-Build37.f.tsv.gz')
+head(GCST90018839_dat)
+format_GCST90018839_dat=gwas2format(
+  gwas_dat = GCST90018839_dat,
+  chr_col = 'chromosome',
+  pos_col = 'base_pair_location',
+  snp_col = 'rsids',
+  effect_allele_col = 'effect_allele',
+  other_allele_col = 'other_allele',
+  eaf_col = 'effect_allele_frequency',
+  beta_col = 'beta',
+  se_col = 'standard_error',
+  pval_col = 'p_value'
+)
+library(MungeSumstats)
+format_GCST90018839_dat<-dplyr::select(GCST90018839_dat,chromosome,base_pair_location,other_allele,effect_allele,beta,standard_error,p_value,effect_allele_frequency)%>%
+  dplyr::rename(CHR='chromosome',BP='base_pair_location',A1='other_allele',A2='effect_allele',BETA='beta',SE='standard_error',P='p_value',freq='effect_allele_frequency')
+
+format_GCST90018839_dat_addSNP<-format_sumstats(format_GCST90018839_dat,ref_genome = 'GRCh37',save_path = 'G:\\GCST90018839_format.txt.gz',nThread = 10)
+
+
+dat=vroom::vroom('GCST90018839_format.txt.gz')
+colnames(dat)
+dat$samplesize=231771
+dat=dat%>%rename(eaf='FRQ',pval='P')
+colnames(dat)=c('SNP','CHR','BP','A1','A2','b','se','p','freq','n')
+vroom::vroom_write(dat,'GCST90018839_format.ma')
+head(dat)
+library(dplyr)
+bb=data.frame(dat)
+bb <- subset(bb, SNP != "")
+bb <- subset(bb, !grepl(",", SNP))
+bb <- subset(bb, !is.na(b))
+bb <- subset(bb, !is.na(se))
+if (any(duplicated(bb$SNP))) {
+  bb <- bb[!duplicated(bb$SNP), ]
+}
+if (any(is.na(bb$freq))) {
+  bb$freq[is.na(bb$freq)] <- "NA"
+}
+if (any(is.na(bb$n))) {
+  bb$n[is.na(bb$n)] <- "NA"
+}
+vroom::vroom_write(bb,'gen_GCST90018839.txg.gz.ma')
+
+
+
+analsis_vcf('ukb-b-10903.vcf.gz' )
+tmp=vroom::vroom('ukb-b-10903.vcf.gz.csv')
+for_mat_ukb_b_10903=gwas2format(
+  tmp,
+  chr_col = 'chr',
+  pos_col = 'pos',
+  snp_col = 'SNP',
+  effect_allele_col = 'effect allele',
+  other_allele_col = 'other allele',
+  eaf_col = 'eaf',
+  beta_col = 'beta',
+  se_col = 'se',
+  pval_col = 'pval',
+  samplesize = 'samplesize'
+)
+library(MendelR)
+format_ukb_b_10903=vroom::vroom('format_ukb_b_10903.gz')
+
+library(dplyr)
+format_ukb_b_10903=rename(format_ukb_b_10903,'samplesize'='ncontrol')
+vroom::vroom_write(format_ukb_b_10903,'format_ukb_b_10903.gz')
+convert_to_ma('format_ukb_b_10903.gz')
+#################
+setwd('D:\\baiduNetdisk\\MR_download\\2023\\drug_MR\\SMR')
+library(MendelR)
+trace('verify',edit = T,where = asNamespace('MendelR'))
+config_old_ieu_api()
+config_mutil_core()
+smr_run_whole(gwas_file = 'gen_format_ukb_b_10903.ma',out_dir = 'E:\\Items\\yuanjiaqi\\Endometriosis\\results\\smr\\smr')
+smr_run_whole(gwas_file = 'gen_finn-b-N14_ENDOMETRIOSIS.ma',out_dir = 'E:\\Items\\yuanjiaqi\\Endometriosis\\results\\smr/finn-b-N14_ENDOMETRIOSIS/')
+dat=vroom::vroom('gen_GCST90018839.txg.gz.ma')
+library(dplyr)
+dat=dat%>%select(SNP,A1,A2,freq,b,se,p,n)
+vroom::vroom_write(dat,'gen_GCST90018839.ma')
+smr_run_whole(gwas_file = 'gen_GCST90018839.ma',
+              out_dir = 'E:\\Items\\yuanjiaqi\\Endometriosis\\results\\smr/GCST90018839')
+
+
+############功能富集分析##################
+genes <- c("KDM5B", "EFCAB2", "ABHD1", "MDH1", "SLC4A5", "ACTR3", "HCG9", "HOXA5", "LRP12", "GSC", "NLRP4", "MCHR1", "AK5", "CCT3", "GMCL1", "GLP1R", "TREML2", "FADS1", "SNX1", "TNFRSF17", "GOT2", "PEMT", "PSMD3", "SMARCE1", "MYOM1", "LMNB2", "SMARCC1", "ASB14", "ABCF1", "HCG27", "PDIA4", "TMEM68", "AKR1C4", "TRIP4", "PRC1", "COG4", "ZZEF1", "KATNAL2", "PGLYRP2", "SEC23B", "RBM12")
+setwd(r'(E:\Items\yuanjiaqi\Endometriosis\results)')
+library(tinyarray)
+
+quick_enrich(genes = genes,kkgo_file = 'xy')
+
+
+
+###########共定位分析###############
+library(MendelR)
+#
+genes=c('LRRC46',
+'DBN1',
+'ATP13A4',
+'IMMT',
+'STARD3NL',
+'DHTKD1',
+'HDLBP',
+'RPS18',
+'RAPGEF3')
+endometr=c('finn-b-N14_ENDOMETRIOSIS','ebi-a-GCST90018839','ukb-b-10903')
+#
+setwd(r'(D:\baiduNetdisk\MR_download\2023\drug_MR\SMR)')
+for(i in genes){
+  for(j in endometr)
+  try(mr_coloc_eqtl2gwas(gene_name = i,gwas_file = j,use_gene_name = TRUE))
+}
+mr_coloc_eqtl2gwas(gene_name = 'RAPGEF3',gwas_file = 'ukb-b-10903',use_gene_name = TRUE,pval_eqtl = 5e-8)

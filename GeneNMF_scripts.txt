@@ -1,0 +1,1830 @@
+# Refactored R Pipeline for GeneNMF and hdWGCNA Integration
+# Description: This script provides a structured workflow for single-cell RNA-seq
+# analysis combining GeneNMF (R package), functional annotation (fgsea/enricher),
+# and hdWGCNA. Outputs plots in PDF format suitable for publication.
+# Addresses potential Seurat v5 compatibility issues, especially for hdWGCNA.
+# Version: GeneNMF_v6_Seuratv5_compat
+
+# --- 0. Load Libraries ---
+# Ensure all necessary packages are installed before running.
+# install.packages(c("Seurat", "SeuratObject", "GeneNMF", "UCell", "Matrix",
+#                    "hdWGCNA", "tidyverse", "clusterProfiler", "msigdbr",
+#                    "enrichplot", "pheatmap", "ComplexHeatmap", "viridis",
+#                    "patchwork", "BiocParallel", "rlang", "fgsea", "qs", "grDevices"))
+
+load_libraries <- function() {
+  message("Loading required libraries...")
+  suppressPackageStartupMessages({
+    library(Seurat)
+    library(SeuratObject)
+    library(GeneNMF)
+    library(UCell)
+    library(Matrix)
+    library(hdWGCNA)
+    library(tidyverse)
+    library(clusterProfiler)
+    library(msigdbr)
+    library(enrichplot)
+    library(pheatmap)
+    library(ComplexHeatmap)
+    library(viridis)
+    library(patchwork)
+    library(tibble)
+    library(BiocParallel)
+    library(rlang)
+    library(fgsea)
+    library(qs)
+    library(grDevices) # For pdf device
+  })
+  message("Libraries loaded.")
+}
+
+# --- 1. Setup and Preprocessing ---
+setup_analysis <- function(config) {
+  message("--- 1. Setting up Analysis ---")
+
+  # 1a. Load Data (Conditional based on config$input_is_seurat_object)
+  message("Loading input data from: ", config$input_data_path)
+  if (!file.exists(config$input_data_path)) {
+    stop("Input data file not found: ", config$input_data_path)
+  }
+
+  if (config$input_is_seurat_object) {
+    # Load directly as Seurat object
+    message("Loading pre-existing Seurat object...")
+    seurat_obj <- readRDS(config$input_data_path)
+    message("Input Seurat object loaded.")
+
+    # --- Checks for pre-loaded Seurat object ---
+    if (!inherits(seurat_obj, "Seurat")) {
+      stop("Loaded object from ", config$input_data_path, " is not a Seurat object.")
+    }
+    message("Object class verified as Seurat.")
+    # Check Seurat object version
+    obj_version <- tryCatch(seurat_obj@version, error = function(e) NA)
+    if(!is.na(obj_version)) message("Seurat object version: ", obj_version)
+    if(!is.na(obj_version) && obj_version >= "5.0.0") {
+        message("Detected Seurat v5 object. Ensure downstream package compatibility, especially hdWGCNA.")
+        # Check default assay - v5 objects might not have a default assay set initially
+        if(length(DefaultAssay(seurat_obj)) == 0 && "RNA" %in% names(seurat_obj@assays)){
+             message("Setting default assay to 'RNA' for v5 object.")
+             DefaultAssay(seurat_obj) <- "RNA"
+        } else if (length(DefaultAssay(seurat_obj)) == 0) {
+             warning("Could not determine or set a default assay for the v5 object.")
+        }
+    }
+
+
+    # Check for cell type annotation
+    if (!config$celltype_col %in% colnames(seurat_obj@meta.data)) {
+      stop("Cell type column '", config$celltype_col, "' not found in the metadata of the loaded Seurat object.")
+    }
+    message("Cell type column '", config$celltype_col, "' found.")
+
+    # Check for splitting column (if specified for GeneNMF)
+    if (!is.null(config$genenmf_split_by) && !config$genenmf_split_by %in% colnames(seurat_obj@meta.data)) {
+         stop("GeneNMF splitting column '", config$genenmf_split_by, "' not found in the metadata.")
+    } else if (!is.null(config$genenmf_split_by)) {
+        message("GeneNMF splitting column '", config$genenmf_split_by, "' found.")
+    } else {
+        message("GeneNMF will run on the whole dataset (no splitting by sample/group).")
+    }
+
+
+    # Check for specified assay (needed for GeneNMF)
+    if (!config$genenmf_assay %in% names(seurat_obj@assays)) {
+         stop("Assay '", config$genenmf_assay, "' specified for GeneNMF not found in the Seurat object.")
+    } else {
+        # Check for specified layer within the assay using Layers() for v5 compatibility
+        assay_layers <- Layers(seurat_obj, assay = config$genenmf_assay)
+        if(!config$genenmf_slot %in% assay_layers) {
+            # Try finding alternative common layers if specified one doesn't exist
+            found_layer <- FALSE
+            for(layer_name in c("data", "counts", "scale.data")){
+                 if(layer_name %in% assay_layers){
+                    message("Specified GeneNMF layer '", config$genenmf_slot, "' not found in assay '", config$genenmf_assay,
+                            "'. Using existing layer '", layer_name, "' instead.")
+                    config$genenmf_slot <<- layer_name # Update config globally for this run
+                    found_layer <- TRUE
+                    break
+                 }
+            }
+             if(!found_layer){
+                stop("Specified GeneNMF layer '", config$genenmf_slot, "' not found in assay '", config$genenmf_assay,
+                     "', and common alternatives ('data', 'counts', 'scale.data') also not found.")
+             }
+        } else {
+            message("Found specified assay '", config$genenmf_assay, "' and layer '", config$genenmf_slot, "' for GeneNMF.")
+        }
+    }
+
+    # --- v5 Compatibility Check for hdWGCNA ---
+    # hdWGCNA often works best with the 'RNA' assay's 'data' layer (log-normalized counts)
+    # Check if the configured assay/layer for hdWGCNA likely exists and is suitable
+    hdwgcna_assay <- config$hdwgcna_assay_for_wgcna %||% "RNA" # Default to RNA if not set
+    hdwgcna_layer <- config$hdwgcna_layer_for_wgcna %||% "data" # Default to data if not set
+    if (!hdwgcna_assay %in% names(seurat_obj@assays)) {
+         warning("Assay '", hdwgcna_assay, "' configured for hdWGCNA not found. hdWGCNA setup might fail.")
+    } else if (!hdwgcna_layer %in% Layers(seurat_obj, assay = hdwgcna_assay)) {
+         warning("Layer '", hdwgcna_layer, "' configured for hdWGCNA not found in assay '", hdwgcna_assay, "'. hdWGCNA setup might fail.")
+    } else {
+         message("hdWGCNA is configured to use assay='", hdwgcna_assay, "', layer='", hdwgcna_layer, "'.")
+         if(hdwgcna_assay == "SCT" && hdwgcna_layer == "data") {
+              warning("Using the 'data' layer of the 'SCT' assay for hdWGCNA is generally NOT recommended as it contains residuals. Consider using 'RNA' assay 'data' layer or SCT 'scale.data' layer if appropriate.")
+         }
+    }
+    # --- End v5 Check ---
+
+
+    # Check if user-specified reductions exist
+    pca_reduction_name <- config$seurat_input_pca_name %||% "pca" # Default to "pca" if NULL
+    umap_reduction_name <- config$seurat_input_umap_name %||% "umap" # Default to "umap" if NULL
+
+    if (!pca_reduction_name %in% names(seurat_obj@reductions)) {
+      warning("PCA reduction named '", pca_reduction_name, "' not found in the loaded Seurat object. Some downstream functions might expect it.")
+    } else {
+      message("PCA reduction named '", pca_reduction_name, "' found.")
+    }
+    if (!umap_reduction_name %in% names(seurat_obj@reductions)) {
+      warning("UMAP reduction named '", umap_reduction_name, "' not found in the loaded Seurat object. Some downstream functions might expect it.")
+    } else {
+      message("UMAP reduction named '", umap_reduction_name, "' found.")
+    }
+
+    message("Skipping standard Seurat preprocessing steps as requested.")
+
+  } else {
+    # Load as SingleCellExperiment and preprocess
+    message("Loading as SingleCellExperiment object and performing preprocessing...")
+    sce <- readRDS(config$input_data_path)
+    message("Input SCE data loaded.")
+
+    if (!inherits(sce, "SingleCellExperiment")) {
+      stop("Loaded object from ", config$input_data_path, " is not a SingleCellExperiment object. Set 'input_is_seurat_object = TRUE' if it's a Seurat object.")
+    }
+
+    # Check for raw counts in SCE
+    if (!"counts" %in% names(assays(sce))) {
+      stop("Raw counts are required in the 'counts' assay slot of the sce object.")
+    }
+    # Check for cell type annotation in SCE
+    if (!config$celltype_col %in% colnames(colData(sce))) {
+      stop("Cell type column '", config$celltype_col, "' not found in colData(sce).")
+    }
+    # Check for splitting column in SCE (if specified for GeneNMF)
+    if (!is.null(config$genenmf_split_by) && !config$genenmf_split_by %in% colnames(colData(sce))) {
+         stop("GeneNMF splitting column '", config$genenmf_split_by, "' not found in colData(sce).")
+    } else if (!is.null(config$genenmf_split_by)) {
+        message("GeneNMF splitting column '", config$genenmf_split_by, "' found.")
+    } else {
+        message("GeneNMF will run on the whole dataset (no splitting by sample/group).")
+    }
+
+
+    # Create and Preprocess Seurat Object
+    message("Creating Seurat object from SCE...")
+    # For v5, CreateSeuratObject might create Assay5 by default depending on version
+    seurat_obj <- Seurat::CreateSeuratObject(counts = assays(sce)$counts,
+                                             meta.data = as.data.frame(colData(sce)))
+
+    message("Preprocessing Seurat object (Normalize, Find HVGs, Scale, PCA, UMAP)...")
+    # These functions generally work with v5, operating on the default assay (likely RNA)
+    seurat_obj <- Seurat::NormalizeData(seurat_obj, verbose = FALSE)
+    seurat_obj <- Seurat::FindVariableFeatures(seurat_obj, verbose = FALSE, nfeatures = config$seurat_n_hvgs)
+    seurat_obj <- Seurat::ScaleData(seurat_obj, verbose = FALSE)
+    seurat_obj <- Seurat::RunPCA(seurat_obj, verbose = FALSE, npcs = config$seurat_n_pcs)
+    seurat_obj <- Seurat::RunUMAP(seurat_obj, dims = 1:config$seurat_umap_dims, verbose = FALSE)
+    message("Seurat object created and preprocessed.")
+    # Store the standard reduction names used during preprocessing
+    pca_reduction_name <- "pca"
+    umap_reduction_name <- "umap"
+
+    # Check if GeneNMF assay/layer exist after conversion/preprocessing
+     if (!config$genenmf_assay %in% names(seurat_obj@assays)) {
+         stop("Assay '", config$genenmf_assay, "' specified for GeneNMF not found after creating Seurat object.")
+     } else {
+        assay_layers <- Layers(seurat_obj, assay = config$genenmf_assay)
+        if(!config$genenmf_slot %in% assay_layers) {
+             # Try finding alternative common layers if specified one doesn't exist
+            found_layer <- FALSE
+            for(layer_name in c("data", "counts", "scale.data")){
+                 if(layer_name %in% assay_layers){
+                    message("Specified GeneNMF layer '", config$genenmf_slot, "' not found in assay '", config$genenmf_assay,
+                            "'. Using existing layer '", layer_name, "' instead.")
+                    config$genenmf_slot <<- layer_name # Update config globally for this run
+                    found_layer <- TRUE
+                    break
+                 }
+            }
+             if(!found_layer){
+                stop("Specified GeneNMF layer '", config$genenmf_slot, "' not found in assay '", config$genenmf_assay,
+                     "', and common alternatives ('data', 'counts', 'scale.data') also not found.")
+             }
+        } else {
+            message("Found specified assay '", config$genenmf_assay, "' and layer '", config$genenmf_slot, "' for GeneNMF.")
+        }
+     }
+     # --- v5 Compatibility Check for hdWGCNA ---
+     hdwgcna_assay <- config$hdwgcna_assay_for_wgcna %||% "RNA"
+     hdwgcna_layer <- config$hdwgcna_layer_for_wgcna %||% "data"
+     if (!hdwgcna_assay %in% names(seurat_obj@assays) || !hdwgcna_layer %in% Layers(seurat_obj, assay = hdwgcna_assay)) {
+          warning("The standard 'RNA' assay 'data' layer (expected by default hdWGCNA settings) was not found after preprocessing. Ensure 'hdwgcna_assay_for_wgcna' and 'hdwgcna_layer_for_wgcna' in config point to a valid, numeric layer.")
+     } else {
+          message("hdWGCNA is configured to use assay='", hdwgcna_assay, "', layer='", hdwgcna_layer, "'.")
+     }
+     # --- End v5 Check ---
+  }
+
+  # Final checks and print info
+  message("--- Setup Summary ---")
+  print(seurat_obj)
+  # Ensure DimPlot uses the correct UMAP reduction name and check existence
+  # Use umap_reduction_name determined above
+  if (exists("umap_reduction_name") && umap_reduction_name %in% names(seurat_obj@reductions)) {
+    dimplot_init <- DimPlot(seurat_obj, group.by = config$celltype_col, label = TRUE, reduction = umap_reduction_name) +
+        NoLegend() +
+        ggtitle(paste("UMAP by Cell Type (Reduction:", umap_reduction_name, ")")) +
+        theme_bw(base_size = config$plot_base_fontsize) + # Use smaller base font
+        theme(plot.title = element_text(hjust = 0.5))
+    print(dimplot_init)
+    # Save initial UMAP as PDF
+    plot_dir_setup <- file.path(config$output_basedir, "plots", "setup")
+    if (!dir.exists(plot_dir_setup)) dir.create(plot_dir_setup, recursive = TRUE)
+    ggsave(file.path(plot_dir_setup, "initial_umap_celltype.pdf"), dimplot_init,
+           width = config$plot_umap_width, height = config$plot_umap_height, units = "in", device="pdf")
+
+  } else {
+    # Try default "umap" if the determined one doesn't exist
+    if ("umap" %in% names(seurat_obj@reductions)) {
+        dimplot_init <- DimPlot(seurat_obj, group.by = config$celltype_col, label = TRUE, reduction = "umap") +
+            NoLegend() +
+            ggtitle("UMAP by Cell Type (Reduction: umap)") +
+            theme_bw(base_size = config$plot_base_fontsize) +
+            theme(plot.title = element_text(hjust = 0.5))
+        print(dimplot_init)
+        plot_dir_setup <- file.path(config$output_basedir, "plots", "setup")
+        if (!dir.exists(plot_dir_setup)) dir.create(plot_dir_setup, recursive = TRUE)
+        ggsave(file.path(plot_dir_setup, "initial_umap_celltype.pdf"), dimplot_init,
+               width = config$plot_umap_width, height = config$plot_umap_height, units = "in", device="pdf")
+    } else {
+      message("Default UMAP reduction ('umap') not available for plotting.")
+    }
+  }
+  message("--- End Setup ---")
+
+  # Return both object and potentially updated config
+  return(list(seurat_obj = seurat_obj, config = config))
+}
+
+
+# --- 2. GeneNMF Analysis ---
+
+# 2a. Run GeneNMF (multiNMF and getMetaPrograms)
+# (Removed verbose flag from multiNMF, ensured list input)
+run_genenmf <- function(seurat_obj, config) {
+  message("--- 2a. Running GeneNMF Analysis ---")
+  output_dir <- file.path(config$output_basedir, "genenmf_analysis")
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+  message("GeneNMF output will be stored in: ", normalizePath(output_dir))
+
+  # Determine number of features
+  n_features_genenmf <- config$genenmf_n_features
+  if (is.null(n_features_genenmf) || n_features_genenmf <= 0) {
+      n_features_genenmf <- nrow(seurat_obj[[config$genenmf_assay]])
+      message("Using all features (", n_features_genenmf, ") for GeneNMF as nfeatures was not specified or invalid.")
+  } else {
+      message("Using ", n_features_genenmf, " features for GeneNMF (based on HVGs found by Seurat if preprocessing was run, otherwise top variance).")
+      # Ensure variable features are found if needed
+      # For v5, FindVariableFeatures defaults might need checking, but usually works on default assay/layer
+      if(length(VariableFeatures(seurat_obj)) < n_features_genenmf) {
+          message("Finding variable features as specified nfeatures > current VariableFeatures...")
+          seurat_obj <- FindVariableFeatures(seurat_obj, assay=config$genenmf_assay, layer=config$genenmf_slot, nfeatures = n_features_genenmf, verbose = FALSE)
+      }
+  }
+
+  # Split object if required OR create a list containing the single object
+  if (!is.null(config$genenmf_split_by)) {
+    message("Splitting Seurat object by '", config$genenmf_split_by, "' for multiNMF.")
+    seu.list <- SplitObject(seurat_obj, split.by = config$genenmf_split_by)
+    message("Running multiNMF across ", length(seu.list), " groups and K = ",
+            paste(config$genenmf_k_range, collapse = ", "))
+    # Make sure each sub-object has variable features defined if using HVGs
+    if(n_features_genenmf > 0 && n_features_genenmf < nrow(seurat_obj[[config$genenmf_assay]])) {
+        message("Finding variable features for each split object...")
+        seu.list <- lapply(seu.list, function(seu_sub){
+             FindVariableFeatures(seu_sub, assay=config$genenmf_assay, layer=config$genenmf_slot, nfeatures = n_features_genenmf, verbose = FALSE)
+        })
+    }
+  } else {
+    message("Running multiNMF on the whole dataset (no splitting) for K = ",
+            paste(config$genenmf_k_range, collapse = ", "))
+    # Create a list containing the single Seurat object
+    seu.list <- list(whole_dataset = seurat_obj) # Give it a name within the list
+    # Ensure variable features are found if needed for the single object
+    if(n_features_genenmf > 0 && n_features_genenmf < nrow(seurat_obj[[config$genenmf_assay]])) {
+        # Check if HVGs are already present and sufficient
+        if(length(VariableFeatures(seu.list$whole_dataset)) < n_features_genenmf) {
+             message("Finding variable features for the single dataset...")
+             seu.list$whole_dataset <- FindVariableFeatures(seu.list$whole_dataset, assay=config$genenmf_assay, layer=config$genenmf_slot, nfeatures = n_features_genenmf, verbose = FALSE)
+        }
+    }
+    message("Input prepared as a list containing the single dataset.")
+  }
+
+  # Pass seu.list (which is guaranteed to be a list) to multiNMF
+  message("Calling multiNMF...")
+  # Use 'layer' argument if GeneNMF supports it, otherwise 'slot' might work via compatibility
+  geneNMF.programs <- multiNMF(seu.list,
+                               assay = config$genenmf_assay,
+                               layer = config$genenmf_slot, # Prefer 'layer' for v5
+                               # slot = config$genenmf_slot, # Fallback if layer not supported
+                               k = config$genenmf_k_range,
+                               nfeatures = n_features_genenmf)
+
+  message("multiNMF call completed.")
+
+  message("Saving raw GeneNMF program results...")
+  qsave(geneNMF.programs, file.path(output_dir, "genenmf_raw_programs.qs"))
+
+  # Get Metaprograms
+  message("Defining Metaprograms (MPs). Target number of MPs: ", config$genenmf_nMP)
+  message("Using weight.explained = ", config$genenmf_weight_explained,
+          ", max.genes = ", config$genenmf_max_genes)
+  geneNMF.metaprograms <- getMetaPrograms(geneNMF.programs,
+                                          nMP = config$genenmf_nMP,
+                                          weight.explained = config$genenmf_weight_explained,
+                                          max.genes = config$genenmf_max_genes)
+
+  message("Saving defined Metaprogram results...")
+  qsave(geneNMF.metaprograms, file.path(output_dir, "genenmf_metaprograms.qs"))
+
+  message("Metaprograms defined. Found ", length(geneNMF.metaprograms$metaprograms.genes), " MPs.")
+  print("Metaprogram Metrics:")
+  print(geneNMF.metaprograms$metaprograms.metrics)
+  message("Note: Examine metrics (sampleCoverage, silhouette, meanSimilarity) to evaluate MP quality.")
+  message("You might need to adjust 'genenmf_nMP' or other parameters and re-run if needed.")
+
+  # Get MP gene lists
+  mp.genes <- geneNMF.metaprograms$metaprograms.genes
+  if(is.null(names(mp.genes)) || length(names(mp.genes)) == 0) {
+       names(mp.genes) <- paste0("MP", seq_along(mp.genes))
+       message("Assigning default names (MP1, MP2...) to metaprograms.")
+  }
+
+
+  # Calculate UCell scores for MPs
+  message("Calculating UCell scores for Metaprograms...")
+  ucell_score_suffix <- paste0("_", config$genenmf_ucell_suffix) # Suffix for score names
+
+  # Ensure the layer exists before running UCell
+  if(!config$genenmf_slot %in% Layers(seurat_obj, assay = config$genenmf_assay)) {
+      stop("Layer '", config$genenmf_slot, "' specified for UCell not found in assay '", config$genenmf_assay, "'. Make sure NormalizeData (or equivalent) was run and layer name is correct.")
+  }
+
+  # Use 'layer' argument for AddModuleScore_UCell if supported, otherwise 'slot' might work via compatibility. Check UCell docs for v5 support.
+  seurat_obj <- AddModuleScore_UCell(seurat_obj,
+                                     features = mp.genes,
+                                     assay = config$genenmf_assay,
+                                     layer = config$genenmf_slot, # Prefer layer for v5
+                                     # slot = config$genenmf_slot, # Fallback
+                                     name = ucell_score_suffix,
+                                     ncores = config$genenmf_num_workers)
+
+  # Extract the UCell scores into a matrix similar to H_matrix for downstream compatibility
+  mp_score_names <- paste0(names(mp.genes), ucell_score_suffix)
+  if (!all(mp_score_names %in% colnames(seurat_obj@meta.data))) {
+      missing_scores <- mp_score_names[!mp_score_names %in% colnames(seurat_obj@meta.data)]
+      warning("Some UCell scores were not found in metadata after AddModuleScore_UCell: ", paste(missing_scores, collapse=", "))
+      # Attempt to find scores that *were* added
+      mp_score_names <- intersect(mp_score_names, colnames(seurat_obj@meta.data))
+      if(length(mp_score_names) == 0){
+          stop("Could not find any UCell scores in metadata. AddModuleScore_UCell might have failed.")
+      }
+  }
+  message("UCell scores added to metadata with names: ", paste(mp_score_names, collapse=", "))
+  H_matrix_ucell <- as.matrix(seurat_obj@meta.data[, mp_score_names, drop = FALSE])
+
+  message("GeneNMF analysis and scoring complete.")
+  return(list(seurat_obj = seurat_obj,
+              metaprograms = geneNMF.metaprograms,
+              mp_genes = mp.genes, # List of gene vectors per MP
+              H_matrix_ucell = H_matrix_ucell, # Matrix of UCell scores (Cells x MPs)
+              config = config)) # Return potentially updated config
+}
+
+
+# 2b. Visualize GeneNMF Results
+# (Switched to PDF output, adjusted sizes)
+visualize_genenmf_results <- function(seurat_obj, metaprograms_obj, H_matrix_ucell, config) {
+  message("--- 2b. Visualizing GeneNMF Results ---")
+  plot_dir <- file.path(config$output_basedir, "plots", "genenmf")
+  if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+
+  # Plot MetaProgram Similarity Dendrogram
+  message("Generating MetaProgram similarity plot...")
+  tryCatch({
+       ph <- plotMetaPrograms(metaprograms_obj, show_heatmap = TRUE) # Use the saved object
+       pdf(file.path(plot_dir, "genenmf_metaprogram_similarity.pdf"), width = 7, height = 5.5) # Adjust size as needed
+       print(ph)
+       dev.off()
+   }, error = function(e){
+        message("Could not generate metaprogram similarity plot: ", e$message)
+   })
+
+
+  # UMAPs colored by MP UCell scores
+  message("Generating UMAP plots for Metaprogram UCell scores...")
+  mp_score_names <- colnames(H_matrix_ucell) # Get names from the UCell score matrix
+  n_plots <- min(length(mp_score_names), config$genenmf_num_umap_plots) # Limit plots
+  plot_list_umap <- list()
+  # Determine UMAP reduction name to use
+  umap_reduction_name <- config$seurat_input_umap_name %||% "umap"
+
+  if (umap_reduction_name %in% names(seurat_obj@reductions)) {
+    for (program_score in mp_score_names[1:n_plots]) {
+      # FeaturePlot generally handles v5 layers well
+      p <- FeaturePlot(seurat_obj, features = program_score, coord.fixed = TRUE, pt.size = config$plot_umap_pt_size, reduction = umap_reduction_name, order = TRUE) +
+        scale_colour_viridis(option = "plasma") +
+        ggtitle(program_score) +
+        theme_bw(base_size = config$plot_base_fontsize) + # Smaller font
+        theme(plot.title = element_text(hjust = 0.5, size = rel(1.0)), # Adjust title size
+              axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),
+              legend.title = element_text(size=rel(0.8)), legend.text=element_text(size=rel(0.7))) # Smaller legend
+      plot_list_umap[[program_score]] <- p
+    }
+    if (length(plot_list_umap) > 0) {
+      ncol_umap <- min(3, n_plots)
+      nrow_umap <- ceiling(n_plots / ncol_umap)
+      combined_plot_umap <- wrap_plots(plot_list_umap, ncol = ncol_umap) +
+        plot_annotation(title = paste("GeneNMF Metaprogram UCell Scores on UMAP (Reduction:", umap_reduction_name, ")")) &
+        theme(plot.title = element_text(hjust = 0.5, size=rel(0.9))) # Adjust overall title size
+
+      print(combined_plot_umap)
+      # Adjust size: approx 2.5-3 inches per panel width/height
+      ggsave(file.path(plot_dir, "genenmf_umap_program_scores.pdf"), combined_plot_umap,
+             width = ncol_umap * config$plot_panel_width, height = nrow_umap * config$plot_panel_height, units = "in", device="pdf")
+    }
+  } else {
+    message("UMAP reduction '", umap_reduction_name, "' not found, skipping MP score UMAP plots.")
+  }
+
+
+  # Heatmap of MP UCell scores across cells (sampled)
+  message("Generating heatmap of Metaprogram UCell scores...")
+  cells_to_plot <- sample(colnames(seurat_obj), min(config$genenmf_heatmap_ncells, ncol(seurat_obj)))
+  # Ensure celltype column exists before ordering/subsetting
+  if (!config$celltype_col %in% colnames(seurat_obj@meta.data)) {
+    message("Celltype column '", config$celltype_col, "' not found. Heatmap will not be ordered by cell type.")
+    cell_order_subset <- cells_to_plot
+    annotation_col <- NULL
+    anno_colors <- NULL
+    col_split <- NULL
+  } else {
+    cell_order <- colnames(seurat_obj)[order(seurat_obj@meta.data[[config$celltype_col]])]
+    cell_order_subset <- intersect(cell_order, cells_to_plot)
+    meta_subset <- seurat_obj@meta.data[cell_order_subset, , drop = FALSE]
+    # Subset H_matrix_ucell based on sampled cells
+    H_subset_ucell <- H_matrix_ucell[cell_order_subset, , drop = FALSE]
+
+    annotation_col = data.frame(
+      Celltype = meta_subset[[config$celltype_col]]
+    )
+    rownames(annotation_col) = rownames(meta_subset)
+
+    # Create colors for cell types
+    celltype_levels <- levels(factor(seurat_obj@meta.data[[config$celltype_col]]))
+    if (length(celltype_levels) == 0) celltype_levels <- unique(seurat_obj@meta.data[[config$celltype_col]]) # Fallback if not factor
+    celltype_colors <- scales::hue_pal()(length(celltype_levels))
+    names(celltype_colors) <- celltype_levels
+    anno_colors <- list(Celltype = celltype_colors)
+    col_split <- annotation_col$Celltype # Split columns by cell type
+  }
+
+  # Adjust H_subset if annotation_col is NULL
+  if(is.null(annotation_col)){
+    H_subset_ucell <- H_matrix_ucell[cell_order_subset, , drop = FALSE] # Subset H_matrix_ucell
+    heatmap_annotation <- NULL
+  } else {
+    # H_subset_ucell already subsetted above
+    heatmap_annotation <- HeatmapAnnotation(df = annotation_col, col = anno_colors,
+                                            annotation_legend_param = list(title_gp = gpar(fontsize=config$plot_fontsize_small),
+                                                                           labels_gp = gpar(fontsize=config$plot_fontsize_tiny)))
+  }
+
+  # Use ComplexHeatmap for better control
+  # Check if H_subset_ucell is valid before proceeding
+  if(nrow(H_subset_ucell) > 0 && ncol(H_subset_ucell) > 0) {
+      heatmap_matrix <- t(H_subset_ucell) # Use original scores: MPs x Cells
+      heatmap_legend_title <- "UCell Score"
+
+      h_heatmap <- ComplexHeatmap::Heatmap(heatmap_matrix,
+                                           name = heatmap_legend_title,
+                                           column_title = paste("GeneNMF MP UCell Scores (Sampled", nrow(H_subset_ucell), "Cells)"),
+                                           row_title = "GeneNMF Metaprograms",
+                                           show_column_names = FALSE,
+                                           cluster_columns = is.null(annotation_col), # Cluster cols only if no annotation/split
+                                           cluster_rows = TRUE,
+                                           col = viridis(100),
+                                           heatmap_legend_param = list(title = heatmap_legend_title,
+                                                                       title_gp = gpar(fontsize=config$plot_fontsize_small),
+                                                                       labels_gp = gpar(fontsize=config$plot_fontsize_tiny)),
+                                           top_annotation = heatmap_annotation,
+                                           row_names_gp = gpar(fontsize = config$plot_fontsize_tiny), # Smaller row names
+                                           column_title_gp = gpar(fontsize = config$plot_fontsize_medium),
+                                           row_title_gp = gpar(fontsize = config$plot_fontsize_medium),
+                                           column_split = col_split,
+                                           use_raster = TRUE, raster_quality = 5 # Use rasterization for large heatmaps
+      )
+
+      pdf(file.path(plot_dir, "genenmf_heatmap_program_scores.pdf"), width = 7, height = 5) # Adjust size
+      draw(h_heatmap)
+      dev.off()
+      print("MP UCell score heatmap saved.")
+  } else {
+      message("Skipping MP UCell score heatmap: Not enough data after subsetting/sampling.")
+  }
+
+
+  # List top genes per program (Instead of W matrix heatmap)
+  message("Listing top genes per GeneNMF metaprogram...")
+  top_genes_list_genenmf <- lapply(metaprograms_obj$metaprograms.genes, head, n = config$genenmf_num_top_genes_list)
+  top_genes_file <- file.path(plot_dir, "genenmf_top_genes_per_metaprogram.txt")
+  sink(top_genes_file)
+  print(top_genes_list_genenmf)
+  sink()
+  message("Top genes list saved to: ", top_genes_file)
+
+
+  # Optional: Plot feature plots for the #1 top gene of each MP
+  message("Generating feature plots for the top gene of selected MPs...")
+  plot_list_topgene <- list()
+   n_topgene_plots <- min(length(metaprograms_obj$metaprograms.genes), config$genenmf_num_umap_plots) # Limit plots
+
+  if (umap_reduction_name %in% names(seurat_obj@reductions)) {
+       for (i in 1:n_topgene_plots) {
+           mp_name <- names(metaprograms_obj$metaprograms.genes)[i]
+           top_gene <- metaprograms_obj$metaprograms.genes[[i]][1]
+           if (!is.na(top_gene) && top_gene %in% rownames(seurat_obj)) {
+                p <- FeaturePlot(seurat_obj, features = top_gene, coord.fixed = TRUE, pt.size = config$plot_umap_pt_size, reduction = umap_reduction_name, order = TRUE) +
+                    scale_colour_viridis(option = "magma") +
+                    ggtitle(paste(mp_name, "-", top_gene)) +
+                    theme_bw(base_size = config$plot_base_fontsize) + # Smaller font
+                    theme(plot.title = element_text(hjust = 0.5, size = rel(1.0)), # Adjust title size
+                          axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),
+                          legend.title = element_text(size=rel(0.8)), legend.text=element_text(size=rel(0.7))) # Smaller legend
+                plot_list_topgene[[mp_name]] <- p
+           } else {
+               message("Skipping top gene plot for ", mp_name, ": gene '", top_gene, "' not found in Seurat object.")
+           }
+       }
+        if (length(plot_list_topgene) > 0) {
+            ncol_topgene <- min(3, length(plot_list_topgene))
+            nrow_topgene <- ceiling(length(plot_list_topgene) / ncol_topgene)
+            combined_plot_topgene <- wrap_plots(plot_list_topgene, ncol = ncol_topgene) +
+                plot_annotation(title = paste("Top Gene Expression per Metaprogram on UMAP (Reduction:", umap_reduction_name, ")")) &
+                theme(plot.title = element_text(hjust = 0.5, size=rel(0.9))) # Adjust overall title size
+
+            print(combined_plot_topgene)
+            ggsave(file.path(plot_dir, "genenmf_umap_top_genes.pdf"), combined_plot_topgene,
+                   width = ncol_topgene * config$plot_panel_width, height = nrow_topgene * config$plot_panel_height, units = "in", device="pdf")
+        }
+
+  } else {
+       message("UMAP reduction '", umap_reduction_name, "' not found, skipping top gene UMAP plots.")
+  }
+
+
+  message("GeneNMF visualization complete.")
+}
+
+
+# --- 3. Functional Annotation (fgsea/enricher) ---
+
+# 3a. Run Functional Enrichment on GeneNMF Metaprograms
+run_fgsea_on_genenmf <- function(mp_genes, seurat_obj, config) {
+  message("--- 3a. Running Functional Enrichment for GeneNMF Metaprograms ---")
+
+  # Prepare gene sets from msigdbr
+  message("Fetching gene sets from msigdbr for species: ", config$gsea_species)
+  gsea_categories <- strsplit(config$gsea_categories, ",")[[1]] # e.g., "H,C5"
+  gsea_subcategories <- if(!is.null(config$gsea_subcategories) && nzchar(config$gsea_subcategories)) strsplit(config$gsea_subcategories, ",")[[1]] else NULL # e.g., "GO:BP"
+
+  # Use a helper function to fetch and format gene sets
+  get_msigdb_genesets <- function(species, category, subcategory = NULL) {
+    mdf <- msigdbr(species = species, category = category, subcategory = subcategory)
+    if (nrow(mdf) > 0) {
+      message("  Loaded ", category, if(!is.null(subcategory)) paste0(":", subcategory) else "", " gene sets (", length(unique(mdf$gs_name)), " sets).")
+      genesets <- mdf %>%
+        dplyr::select(gs_name, gene_symbol) %>%
+        group_by(gs_name) %>%
+        summarise(genes = list(unique(gene_symbol)), .groups = "drop") %>%
+        deframe() # Convert to named list
+      return(genesets)
+    } else {
+      message("  No gene sets found for ", category, if(!is.null(subcategory)) paste0(":", subcategory) else "")
+      return(list())
+    }
+  }
+
+  all_genesets <- list()
+  if ("H" %in% gsea_categories) {
+      all_genesets$Hallmark <- get_msigdb_genesets(config$gsea_species, "H")
+  }
+   if ("C5" %in% gsea_categories) {
+     if (is.null(gsea_subcategories) || "GO:BP" %in% gsea_subcategories) {
+        all_genesets$GO_BP <- get_msigdb_genesets(config$gsea_species, "C5", "GO:BP")
+     }
+     if (!is.null(gsea_subcategories) && "GO:MF" %in% gsea_subcategories) {
+        all_genesets$GO_MF <- get_msigdb_genesets(config$gsea_species, "C5", "GO:MF")
+     }
+      if (!is.null(gsea_subcategories) && "GO:CC" %in% gsea_subcategories) {
+         all_genesets$GO_CC <- get_msigdb_genesets(config$gsea_species, "C5", "GO:CC")
+     }
+  }
+  if ("C2" %in% gsea_categories) {
+     if (is.null(gsea_subcategories) || "CP:KEGG" %in% gsea_subcategories) {
+        all_genesets$KEGG <- get_msigdb_genesets(config$gsea_species, "C2", "CP:KEGG")
+     }
+     if (!is.null(gsea_subcategories) && "CP:REACTOME" %in% gsea_subcategories) {
+        all_genesets$Reactome <- get_msigdb_genesets(config$gsea_species, "C2", "CP:REACTOME")
+     }
+   }
+   if ("C7" %in% gsea_categories) {
+     if (is.null(gsea_subcategories) || "IMMUNESIGDB" %in% gsea_subcategories) {
+        all_genesets$ImmuneSigDB <- get_msigdb_genesets(config$gsea_species, "C7", "IMMUNESIGDB")
+     }
+   }
+
+  # Filter out empty gene set lists
+  all_genesets <- all_genesets[sapply(all_genesets, length) > 0]
+
+  if (length(all_genesets) == 0) {
+    stop("No valid gene set categories specified or loaded.")
+  }
+
+  # Define the universe of genes
+  # For v5, access rownames potentially directly from the assay object if counts layer represents all features
+  # Or use rownames(seurat_obj) if features are consistent across the object
+  if ("counts" %in% Layers(seurat_obj, assay = config$genenmf_assay)) {
+       universe <- rownames(LayerData(seurat_obj, assay = config$genenmf_assay, layer = "counts"))
+       message("Using universe of ", length(universe), " genes from assay '", config$genenmf_assay, "' counts layer.")
+  } else {
+       universe <- rownames(seurat_obj[[config$genenmf_assay]]) # Fallback to assay rownames
+       message("Using universe of ", length(universe), " genes from assay '", config$genenmf_assay, "' rownames (counts layer preferred).")
+  }
+
+
+  # Define a helper function to run enricher for one program and one geneset collection
+  run_single_enricher <- function(program_genes, genesets, universe, config) {
+     # Filter program genes to be within the universe
+     program_genes_filtered <- intersect(program_genes, universe)
+     if (length(program_genes_filtered) < config$fgsea_min_program_genes) {
+         message("  Skipping: Program has fewer than ", config$fgsea_min_program_genes, " genes in the universe.")
+         return(data.frame())
+     }
+
+     # Create TERM2GENE format for enricher
+     term2gene_df <- stack(genesets) %>%
+       rename(gene_symbol = values, gs_name = ind) %>%
+       dplyr::select(gs_name, gene_symbol)
+
+     tryCatch({
+         enrich_res <- enricher(gene = program_genes_filtered,
+                                TERM2GENE = term2gene_df,
+                                universe = universe,
+                                pvalueCutoff = config$fgsea_pval_cutoff, # Use the pval cutoff here
+                                pAdjustMethod = "BH",
+                                minGSSize = config$fgsea_min_geneset_size,
+                                maxGSSize = config$fgsea_max_geneset_size)
+
+         if (!is.null(enrich_res) && nrow(enrich_res@result) > 0) {
+             res_df <- as.data.frame(enrich_res@result)
+             # Add overlap calculation
+             res_df <- res_df %>%
+                 rowwise() %>%
+                 mutate(
+                     overlap = length(intersect(unlist(strsplit(geneID, "/")), program_genes_filtered)),
+                     # overlapGenes = paste(intersect(unlist(strsplit(geneID, "/")), program_genes_filtered), collapse=",") # Optional
+                 ) %>%
+                 ungroup()
+             return(res_df)
+         } else {
+             return(data.frame())
+         }
+     }, error = function(e) {
+         message("  enricher failed: ", e$message)
+         return(data.frame())
+     })
+  }
+
+
+  # Run enricher for each MP and each gene set collection
+  enrichment_results_list <- list()
+
+  for (mp_name in names(mp_genes)) {
+    message("Running enrichment analysis for ", mp_name)
+    program_genes <- mp_genes[[mp_name]]
+
+    if(length(program_genes) == 0) {
+      message("  Skipping: ", mp_name, " has no genes.")
+      enrichment_results_list[[mp_name]] <- list()
+      next
+    }
+
+    program_enrichment_results <- list()
+    for (gs_coll_name in names(all_genesets)) {
+      message("  Gene Set Collection: ", gs_coll_name)
+      genesets <- all_genesets[[gs_coll_name]]
+      if(length(genesets) > 0) {
+          enrich_res_df <- run_single_enricher(program_genes, genesets, universe, config)
+          program_enrichment_results[[gs_coll_name]] <- enrich_res_df
+      } else {
+           message("  Skipping empty gene set collection: ", gs_coll_name)
+           program_enrichment_results[[gs_coll_name]] <- data.frame()
+      }
+    }
+    enrichment_results_list[[mp_name]] <- program_enrichment_results
+  }
+
+  message("Functional enrichment analysis (using clusterProfiler::enricher) complete.")
+  return(enrichment_results_list)
+}
+
+
+# 3b. Visualize Enrichment Results
+# *** CORRECTED GeneRatio Handling ***
+visualize_enrichment_results <- function(enrichment_results_list, config) {
+  message("--- 3b. Visualizing Enrichment Results ---")
+  plot_dir <- file.path(config$output_basedir, "plots", "functional_enrichment")
+  if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+
+  if (length(enrichment_results_list) == 0 || all(sapply(enrichment_results_list, length) == 0)) {
+    message("No enrichment results found to visualize.")
+    return()
+  }
+
+  # Determine gene set names from the first valid result
+  first_valid_result_index <- which(sapply(enrichment_results_list, function(x) !is.null(x) && length(x) > 0))[1]
+  if (is.na(first_valid_result_index)) {
+      message("Could not find any valid enrichment results to determine gene set names.")
+      return()
+  }
+  first_valid_result <- enrichment_results_list[[first_valid_result_index]]
+   if (is.null(first_valid_result) || length(first_valid_result) == 0) {
+      message("Could not determine gene set names from enrichment results.")
+      return()
+  }
+  gene_set_names <- names(first_valid_result)
+
+
+  for (gs_name in gene_set_names) {
+    message("Generating enrichment summary plot for: ", gs_name)
+    all_results_for_gs <- bind_rows(
+      lapply(names(enrichment_results_list), function(mp_name) {
+        if (!is.null(enrichment_results_list[[mp_name]]) && gs_name %in% names(enrichment_results_list[[mp_name]])) {
+          res_df <- enrichment_results_list[[mp_name]][[gs_name]]
+          if (!is.null(res_df) && nrow(res_df) > 0 && "p.adjust" %in% colnames(res_df)) {
+            res_df %>%
+              mutate(Program = mp_name) %>%
+              filter(p.adjust < config$enrichment_plot_fdr_cutoff) # Use the FDR cutoff
+          } else { NULL }
+        } else { NULL }
+      })
+    )
+
+    if (!is.null(all_results_for_gs) && nrow(all_results_for_gs) > 0) {
+        # *** START MODIFICATION: Ensure GeneRatio is numeric ***
+        size_aes_col <- NULL # Initialize variable to store the name of the column for size aesthetic
+
+        if ("GeneRatio" %in% colnames(all_results_for_gs)) {
+            # Check if it's character (e.g., "3/50") and convert
+            if (is.character(all_results_for_gs$GeneRatio)) {
+                message("Converting character GeneRatio (e.g., 'Count/SetSize') to numeric for: ", gs_name)
+                # Use suppressWarnings to handle potential NAs during conversion gracefully
+                suppressWarnings({
+                    all_results_for_gs <- all_results_for_gs %>%
+                        mutate(
+                            GeneRatioNumeric = sapply(GeneRatio, function(x) {
+                                parts <- as.numeric(strsplit(x, "/")[[1]]);
+                                if(length(parts) == 2 && !is.na(parts[1]) && !is.na(parts[2]) && parts[2] != 0) {
+                                    return(parts[1] / parts[2])
+                                } else {
+                                    return(NA) # Return NA if format is unexpected or denominator is zero
+                                }
+                            })
+                        )
+                })
+                # Handle potential NAs from conversion failure
+                na_ratios <- is.na(all_results_for_gs$GeneRatioNumeric)
+                if(any(na_ratios)) {
+                    warning("Could not convert some GeneRatio strings to numeric for ", gs_name, ". Plot sizes for these terms might be affected.")
+                    # Fallback for NAs: use Count? Or set to a small value? Let's use Count if available.
+                     if("Count" %in% colnames(all_results_for_gs)){
+                          message("Using 'Count' as fallback size for terms where GeneRatio conversion failed.")
+                          all_results_for_gs$GeneRatioNumeric[na_ratios] <- all_results_for_gs$Count[na_ratios]
+                          # If Count is also problematic, set to 0 or a small number
+                          all_results_for_gs$GeneRatioNumeric[is.na(all_results_for_gs$GeneRatioNumeric)] <- 0
+                     } else {
+                          message("Using 0 as fallback size for terms where GeneRatio conversion failed and Count is unavailable.")
+                          all_results_for_gs$GeneRatioNumeric[na_ratios] <- 0
+                     }
+                }
+                size_aes_col <- "GeneRatioNumeric" # Use the new numeric column for size
+            } else if (is.numeric(all_results_for_gs$GeneRatio)) {
+                 message("GeneRatio column is already numeric for: ", gs_name)
+                 size_aes_col <- "GeneRatio" # Use the existing numeric column
+            } else {
+                 warning("GeneRatio column has unexpected type for ", gs_name, ". Attempting fallback calculation.")
+                 # Fallback if type is weird
+                 if(all(c("Count", "BgRatio") %in% colnames(all_results_for_gs))){
+                      message("Calculating numeric GeneRatio from Count and BgRatio for: ", gs_name)
+                      all_results_for_gs <- all_results_for_gs %>%
+                           mutate(GeneRatioNumeric = Count / as.numeric(gsub("/.*", "", BgRatio)))
+                      size_aes_col <- "GeneRatioNumeric"
+                 } else if ("Count" %in% colnames(all_results_for_gs)) {
+                      message("Warning: Cannot calculate GeneRatio. Using 'Count' for plot size for: ", gs_name)
+                      all_results_for_gs$GeneRatioNumeric <- all_results_for_gs$Count
+                      size_aes_col <- "GeneRatioNumeric" # Or maybe just "Count"? Let's stick to calculated ratio if possible.
+                 } else {
+                      warning("Cannot determine values for plot point size for ", gs_name, ". Size mapping will be problematic.")
+                      all_results_for_gs$GeneRatioNumeric <- 1 # Assign a default size value
+                      size_aes_col <- "GeneRatioNumeric"
+                 }
+            }
+        } else if (all(c("Count", "BgRatio") %in% colnames(all_results_for_gs))) {
+            # Calculate GeneRatio if missing
+            message("Calculating numeric GeneRatio from Count and BgRatio for: ", gs_name)
+            all_results_for_gs <- all_results_for_gs %>%
+                 mutate(GeneRatioNumeric = Count / as.numeric(gsub("/.*", "", BgRatio)))
+            size_aes_col <- "GeneRatioNumeric"
+        } else if ("Count" %in% colnames(all_results_for_gs)) {
+             # Fallback to Count if BgRatio is missing
+             message("Warning: Cannot calculate GeneRatio. Using 'Count' for plot size for: ", gs_name)
+             all_results_for_gs$GeneRatioNumeric <- all_results_for_gs$Count
+             size_aes_col <- "GeneRatioNumeric" # Use Count column renamed for consistency
+        } else {
+            warning("Cannot determine values for plot point size for ", gs_name, ". Size mapping will be problematic.")
+            # Assign a default size value if no other option
+             all_results_for_gs$GeneRatioNumeric <- 1
+             size_aes_col <- "GeneRatioNumeric"
+        }
+
+        # Ensure the chosen size column exists before proceeding
+        if(is.null(size_aes_col) || !size_aes_col %in% colnames(all_results_for_gs)){
+             stop("Could not identify or create a numeric column for point size aesthetic for: ", gs_name)
+        }
+        # *** END MODIFICATION ***
+
+        if (!"Description" %in% colnames(all_results_for_gs)) {
+             all_results_for_gs$Description <- all_results_for_gs$ID # Use ID if Description missing
+        }
+
+
+      # Select top terms per program based on p.adjust
+      top_terms_per_program <- all_results_for_gs %>%
+        # Ensure the size column is not NA before filtering/arranging if it causes issues
+        filter(!is.na(.data[[size_aes_col]])) %>%
+        mutate(Description_clean = sub("^(HALLMARK|GOBP|GOMF|GOCC|KEGG|REACTOME)_", "", Description)) %>% # Clean names
+        group_by(Program) %>%
+        arrange(p.adjust) %>%
+        slice_head(n = config$enrichment_plot_top_n_terms) %>%
+        ungroup() %>%
+         mutate(log10P = -log10(p.adjust))
+
+        # Check if any terms remain after filtering
+        if(nrow(top_terms_per_program) == 0) {
+             message("No significant terms left to plot for ", gs_name, " after filtering.")
+             next # Skip to the next gene set collection
+        }
+
+        # Order factor levels for plotting
+        program_order <- names(enrichment_results_list)[names(enrichment_results_list) %in% unique(top_terms_per_program$Program)] # Order programs as they appear
+        term_order <- top_terms_per_program %>%
+             group_by(Description_clean) %>%
+             summarise(maxLogP = max(log10P, na.rm = TRUE), .groups = "drop") %>%
+             arrange(desc(maxLogP)) %>%
+             pull(Description_clean)
+
+         top_terms_per_program <- top_terms_per_program %>%
+              mutate(Program = factor(Program, levels = program_order),
+                     Description_clean = factor(Description_clean, levels = rev(term_order))) # rev for ggplot y-axis
+
+
+      # Create Dot Plot - *** Use the numeric size_aes_col ***
+      enrich_dotplot <- ggplot(top_terms_per_program,
+                                aes(x = Program, y = Description_clean, size = .data[[size_aes_col]], color = log10P)) + # Use .data[[]]
+        geom_point() +
+        scale_color_viridis(name = "-log10(adj.P)") +
+        scale_size(range = c(1.5, 6), name="Gene Ratio") + # Adjust size range, name is still Gene Ratio conceptually
+        theme_bw(base_size = config$plot_base_fontsize) + # Smaller base font
+        ylab(paste(gs_name, "Gene Sets")) +
+        xlab("GeneNMF Metaprogram") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, size=rel(0.9)), # Adjust text size
+              axis.text.y = element_text(size=rel(0.8)), # Adjust text size
+              plot.title = element_text(hjust = 0.5, size=rel(1.1)),
+              legend.title = element_text(size=rel(0.8)),
+              legend.text = element_text(size=rel(0.7))) +
+        ggtitle(paste("Top", config$enrichment_plot_top_n_terms, "Significant", gs_name, "Enrichment Results per MP"))
+
+      print(enrich_dotplot)
+      # Adjust plot size based on number of programs and terms
+      plot_width <- max(3.5, length(program_order) * 0.6 + 2) # Base width + per program width
+      plot_height <- max(3, length(unique(top_terms_per_program$Description_clean)) * 0.2 + 1.5) # Base height + per term height (use unique terms plotted)
+      ggsave(file.path(plot_dir, paste0("enrichment_summary_dotplot_", gs_name, ".pdf")),
+             enrich_dotplot, width = plot_width, height = plot_height,
+             units = "in", device = "pdf", limitsize = FALSE)
+
+    } else {
+      message("No significant enrichment results found for ", gs_name, " at p.adjust < ", config$enrichment_plot_fdr_cutoff)
+    }
+  }
+  message("Enrichment visualization complete.")
+}
+
+
+# --- 4. hdWGCNA Analysis ---
+
+# 4a. Setup hdWGCNA Environment
+# *** CORRECTED SetDatExpr call when using metacells ***
+setup_hdwgcna <- function(seurat_obj, config) {
+  message("--- 4a. Setting up hdWGCNA ---")
+
+  # Check if the specified assay exists before SetupForWGCNA
+  if (!config$hdwgcna_assay_for_wgcna %in% names(seurat_obj@assays)) {
+      stop("Assay '", config$hdwgcna_assay_for_wgcna, "' specified for hdWGCNA not found in Seurat object.")
+  }
+  # Check if the specified layer exists
+   if(!config$hdwgcna_layer_for_wgcna %in% Layers(seurat_obj, assay = config$hdwgcna_assay_for_wgcna)){
+       stop("Layer '", config$hdwgcna_layer_for_wgcna, "' not found in assay '", config$hdwgcna_assay_for_wgcna,"' for hdWGCNA setup.")
+   }
+   # Add a warning if using SCT data layer for WGCNA
+   if(config$hdwgcna_assay_for_wgcna == "SCT" && config$hdwgcna_layer_for_wgcna == "data") {
+        warning("Using the 'data' layer of the 'SCT' assay for hdWGCNA is generally NOT recommended. Consider using 'RNA' assay 'data' layer.")
+   }
+
+
+  seurat_obj <- SetupForWGCNA(
+    seurat_obj,
+    gene_select = config$hdwgcna_gene_select_method,
+    features = if(config$hdwgcna_gene_select_method == "custom") config$hdwgcna_custom_features else NULL,
+    wgcna_name = config$hdwgcna_name,
+    assay = config$hdwgcna_assay_for_wgcna # Specify assay here too
+  )
+
+  if (config$hdwgcna_use_metacells) {
+    message("Constructing metacells by group: ", paste(config$hdwgcna_metacell_group_by, collapse=", "))
+    if (!all(config$hdwgcna_metacell_group_by %in% colnames(seurat_obj@meta.data))) {
+      stop("Metacell grouping variable(s) not found in Seurat metadata: ",
+           paste(config$hdwgcna_metacell_group_by[!config$hdwgcna_metacell_group_by %in% colnames(seurat_obj@meta.data)], collapse=", "))
+    }
+    # *** CORRECTED CALL: Removed 'assay' argument from MetacellsByGroups ***
+    seurat_obj <- MetacellsByGroups(
+      seurat_obj = seurat_obj,
+      group.by = config$hdwgcna_metacell_group_by,
+      k = config$hdwgcna_metacell_k,
+      max_shared = config$hdwgcna_metacell_max_shared,
+      ident.group = config$hdwgcna_metacell_ident
+      # assay = config$hdwgcna_assay_for_wgcna # <-- REMOVED THIS INVALID ARGUMENT
+    )
+
+    metacell_assay_name <- config$hdwgcna_metacell_ident %||% paste0(config$hdwgcna_assay_for_wgcna, "_metacell")
+
+    if (!metacell_assay_name %in% names(seurat_obj@assays)) {
+        alt_assay_name <- paste0(config$hdwgcna_assay_for_wgcna, "_metacell")
+        if(alt_assay_name %in% names(seurat_obj@assays)){
+             metacell_assay_name <- alt_assay_name
+             message("Using found metacell assay: ", metacell_assay_name)
+        } else {
+             # Attempt to find assay named after ident.group if different
+             ident_group_assay <- config$hdwgcna_metacell_ident
+             if(!is.null(ident_group_assay) && ident_group_assay %in% names(seurat_obj@assays)){
+                 metacell_assay_name <- ident_group_assay
+                 message("Using found metacell assay named after ident.group: ", metacell_assay_name)
+             } else {
+                 stop("Metacell assay ('", metacell_assay_name, "' or '", alt_assay_name, "' or '", ident_group_assay, "') not found after running MetacellsByGroups.")
+             }
+        }
+    }
+
+    # Normalize and Scale the metacell assay
+    # Check if layers exist before normalizing/scaling
+    if(!"counts" %in% Layers(seurat_obj, assay=metacell_assay_name) && !"data" %in% Layers(seurat_obj, assay=metacell_assay_name)){
+        warning("Neither 'counts' nor 'data' layer found in metacell assay '", metacell_assay_name, "'. Skipping NormalizeData/ScaleData. Ensure the specified 'hdwgcna_layer_for_wgcna' exists.")
+    } else {
+        seurat_obj <- NormalizeData(seurat_obj, assay = metacell_assay_name, normalization.method = 'LogNormalize', verbose=FALSE)
+        seurat_obj <- ScaleData(seurat_obj, assay = metacell_assay_name, verbose=FALSE)
+    }
+
+
+    message("Setting expression data for WGCNA using metacells from assay: ", metacell_assay_name)
+    # *** MODIFIED SetDatExpr call for metacells: Removed group.by, set group_name ***
+    seurat_obj <- SetDatExpr(
+      seurat_obj,
+      assay = metacell_assay_name,  # Assay containing metacell expression
+      layer = config$hdwgcna_layer_for_wgcna, # Layer with expression data ('data' or 'scale.data')
+      # group.by = config$hdwgcna_metacell_group_by, # REMOVE group.by - network is on metacells themselves
+      group_name = config$hdwgcna_metacell_ident # Use the metacell ID column name as the group_name identifier
+                                                # This tells hdWGCNA the observations *are* the metacells.
+    )
+    # Store the metacell identifier column name for later use (e.g., ModuleTraitCorrelation)
+    seurat_obj@misc[[config$hdwgcna_name]]$metacell_ident <- config$hdwgcna_metacell_ident
+
+  } else {
+    # This part for single-cell WGCNA remains the same
+    message("Setting expression data for WGCNA using single cells from assay: ", config$hdwgcna_assay_for_wgcna)
+    if (!is.null(config$hdwgcna_group.by) && !all(config$hdwgcna_group.by %in% colnames(seurat_obj@meta.data))) {
+      stop("hdWGCNA grouping variable(s) not found in Seurat metadata: ",
+           paste(config$hdwgcna_group.by[!config$hdwgcna_group.by %in% colnames(seurat_obj@meta.data)], collapse=", "))
+    }
+
+    seurat_obj <- SetDatExpr(
+      seurat_obj,
+      group_name = config$hdwgcna_group_name, # Use a general name or specific group name if group.by is set
+      group.by = config$hdwgcna_group.by,     # Group single cells if needed
+      assay = config$hdwgcna_assay_for_wgcna,
+      layer = config$hdwgcna_layer_for_wgcna
+    )
+    seurat_obj@misc[[config$hdwgcna_name]]$metacell_ident <- NULL
+  }
+
+  # --- The rest of the setup_hdwgcna function remains the same ---
+  message("Testing soft power thresholds...")
+  # Wrap TestSoftPowers in tryCatch as it calls WGCNA::goodGenes which caused the error
+   soft_power_results <- tryCatch({
+        TestSoftPowers(
+            seurat_obj,
+            networkType = config$hdwgcna_network_type
+            # setDatExpr = FALSE # Default is FALSE
+        )
+    }, error = function(e) {
+        message("Error occurred during TestSoftPowers (likely in WGCNA::goodGenes): ", e$message)
+        message("This often happens if the data specified by SetDatExpr (assay='", config$hdwgcna_assay_for_wgcna, "', layer='", config$hdwgcna_layer_for_wgcna, "') is not suitable (e.g., SCT data layer, non-numeric data).")
+        message("Recommendation: Ensure hdWGCNA uses the 'RNA' assay and 'data' layer (log-normalized counts).")
+        stop("Stopping execution due to error in TestSoftPowers.")
+        # return(NULL) # Or return NULL if you want to handle it differently
+    })
+
+   # If TestSoftPowers was successful, proceed
+   seurat_obj <- soft_power_results # Assign the returned object back
+
+  plot_dir <- file.path(config$output_basedir, "plots", "hdwgcna")
+  if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+  message("Plotting soft power thresholds...")
+  plot_list <- PlotSoftPowers(seurat_obj)
+  plot_list <- lapply(plot_list, function(p) p + theme_bw(base_size = config$plot_base_fontsize) + theme(plot.title = element_text(hjust=0.5, size=rel(1.0))))
+  softpower_plot <- wrap_plots(plot_list, ncol = 2) + plot_annotation(title = "hdWGCNA Soft Power Selection") & theme(plot.title = element_text(hjust=0.5, size=rel(1.1)))
+  print(softpower_plot)
+  ggsave(file.path(plot_dir, "hdwgcna_softpower_selection.pdf"), softpower_plot, width = 7, height = 3.5, units = "in", device="pdf")
+
+  power_table <- GetPowerTable(seurat_obj)
+  message("Soft power table:")
+  print(power_table)
+  message("Examine the plot and table to choose the appropriate 'hdwgcna_soft_power' value in the config.")
+  message("Typically choose the lowest power where the scale-free topology fit (SFT.R.sq) plateaus above ", config$hdwgcna_min_rsquared)
+
+  message("hdWGCNA setup complete.")
+  return(seurat_obj)
+}
+
+
+# 4b. Construct Network and Find Modules
+run_hdwgcna_network <- function(seurat_obj, config) {
+  message("--- 4b. Running hdWGCNA Network Construction ---")
+  if (is.null(config$hdwgcna_soft_power)) {
+    stop("Please set 'hdwgcna_soft_power' in the configuration based on the soft power plots.")
+  }
+  message("Using soft power: ", config$hdwgcna_soft_power)
+
+  message("Constructing co-expression network (TOM)...")
+  seurat_obj <- ConstructNetwork(
+    seurat_obj, soft_power = config$hdwgcna_soft_power,
+    setDatExpr = FALSE,
+    tom_name = config$hdwgcna_tom_name,
+    overwrite_tom = TRUE,
+    networkType = config$hdwgcna_network_type
+  )
+
+  plot_dir <- file.path(config$output_basedir, "plots", "hdwgcna")
+  pdf(file.path(plot_dir, "hdwgcna_dendrogram.pdf"), width = 7, height = 4.5) # Adjust size
+  PlotDendrogram(seurat_obj, main = paste(config$hdwgcna_name, 'Dendrogram'))
+  dev.off()
+  print("Dendrogram saved.")
+
+  message("Computing module eigengenes (MEs)...")
+  group.by.var <- seurat_obj@misc[[config$hdwgcna_name]]$metacell_ident # Will be NULL if not using metacells
+  if (is.null(group.by.var)) {
+      group.by.var <- seurat_obj@misc[[config$hdwgcna_name]]$datExpr$group.by # Get from SetDatExpr step
+  }
+
+   use_harmonized_mes <- !is.null(seurat_obj@misc[[config$hdwgcna_name]]$metacell_ident)
+
+  if(use_harmonized_mes) {
+       message("Calculating MEs for metacells.")
+       seurat_obj <- ModuleEigengenes(seurat_obj, group.by.vars = config$hdwgcna_metacell_ident)
+  } else {
+       message("Calculating MEs for single cells, grouped by: ", paste(group.by.var %||% "all cells", collapse=", "))
+       seurat_obj <- ModuleEigengenes(seurat_obj, group.by.vars = group.by.var)
+  }
+
+
+  message("Computing module connectivity (kME)...")
+  if(use_harmonized_mes) {
+       message("Calculating kME based on metacells.")
+       seurat_obj <- ModuleConnectivity(seurat_obj, group.by = config$hdwgcna_metacell_ident, group_name = config$hdwgcna_metacell_ident)
+  } else {
+      message("Calculating kME based on single cells, grouped by: ", paste(group.by.var %||% "all cells", collapse=", "))
+      seurat_obj <- ModuleConnectivity(seurat_obj, group.by = group.by.var, group_name = group.by.var)
+  }
+
+
+  if (config$hdwgcna_compute_module_scores) {
+    message("Computing module expression scores (on single cells)...")
+    umap_reduction_name <- config$seurat_input_umap_name %||% "umap"
+    if (!umap_reduction_name %in% names(seurat_obj@reductions)) {
+      warning("UMAP reduction '", umap_reduction_name, "' not found. Module scores will be computed but cannot be plotted on UMAP by default.")
+    }
+    # ModuleExprScore computes scores on the original single-cell level
+    seurat_obj <- ModuleExprScore(
+      seurat_obj,
+      n_genes = config$hdwgcna_module_score_n_genes,
+      method = 'UCell' # Changed to UCell for consistency
+    )
+  }
+
+  message("hdWGCNA network construction and module definition complete.")
+  return(seurat_obj)
+}
+
+# 4c. Visualize hdWGCNA Modules
+visualize_hdwgcna_modules <- function(seurat_obj, config) {
+  message("--- 4c. Visualizing hdWGCNA Modules ---")
+  plot_dir <- file.path(config$output_basedir, "plots", "hdwgcna")
+  # Determine UMAP reduction name to use
+  umap_reduction_name <- config$seurat_input_umap_name %||% "umap"
+
+  if (config$hdwgcna_compute_module_scores && umap_reduction_name %in% names(seurat_obj@reductions)) {
+    message("Generating UMAP plots for module scores...")
+    modules <- GetModules(seurat_obj)
+     if (is.null(modules) || nrow(modules) == 0) {
+         message("Could not retrieve modules using GetModules. Skipping module score plots.")
+         return()
+     }
+
+    module_colors <- modules %>% filter(module != 'grey') %>% pull(module) %>% unique()
+    # Module scores from ModuleExprScore (UCell method) usually just MEcolor_UCell ? Check metadata.
+    # Let's assume they are named like 'MEblue_UCell', 'MEbrown_UCell' etc.
+    potential_score_prefixes <- paste0("ME", module_colors, "_") # Assuming UCell adds suffix like GeneNMF step
+    ucell_suffix_wgcna <- "UCell" # Assuming this suffix from ModuleExprScore(method='UCell')
+
+    all_meta_cols <- colnames(seurat_obj@meta.data)
+    module_scores_found <- unlist(sapply(paste0("ME", module_colors), function(pfx) grep(paste0("^", pfx), all_meta_cols, value = TRUE)))
+    module_scores_found <- module_scores_found[endsWith(module_scores_found, paste0("_", ucell_suffix_wgcna))] # Filter for UCell scores
+
+    if(length(module_scores_found) == 0) {
+        message("Could not find module scores in metadata matching expected UCell pattern (e.g., 'MEblue_UCell'). Skipping UMAP plots.")
+        return()
+    }
+
+    module_scores_found <- unique(module_scores_found)
+    message("Found module scores: ", paste(module_scores_found, collapse=", "))
+
+    n_plots <- min(length(module_scores_found), config$hdwgcna_num_umap_plots)
+    plot_list_mod_umap <- list()
+
+    plotted_count = 0
+    for(score_name in module_scores_found){
+      if (plotted_count < n_plots) {
+        p <- FeaturePlot(seurat_obj, features = score_name, coord.fixed = TRUE, pt.size = config$plot_umap_pt_size, reduction = umap_reduction_name, order=TRUE) +
+          scale_color_viridis(option="magma") +
+          ggtitle(paste(gsub(paste0("_", ucell_suffix_wgcna), "", score_name), "Score")) + # Clean name for title
+          theme_bw(base_size = config$plot_base_fontsize) + # Smaller font
+          theme(plot.title = element_text(hjust = 0.5, size = rel(1.0)), # Adjust title size
+                axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),
+                legend.title = element_text(size=rel(0.8)), legend.text=element_text(size=rel(0.7))) # Smaller legend
+        plot_list_mod_umap[[score_name]] <- p
+        plotted_count <- plotted_count + 1
+      } else {
+          break
+      }
+    }
+
+    if (length(plot_list_mod_umap) > 0) {
+        ncol_wgcna <- min(3, plotted_count)
+        nrow_wgcna <- ceiling(plotted_count / ncol_wgcna)
+        combined_plot_mod_umap <- wrap_plots(plot_list_mod_umap, ncol = ncol_wgcna) +
+            plot_annotation(title = paste("hdWGCNA Module Scores on UMAP (Reduction:", umap_reduction_name, ")")) &
+            theme(plot.title = element_text(hjust = 0.5, size=rel(0.9))) # Adjust overall title size
+
+        print(combined_plot_mod_umap)
+        ggsave(file.path(plot_dir, "hdwgcna_umap_module_scores.pdf"), combined_plot_mod_umap,
+               width = ncol_wgcna * config$plot_panel_width, height = nrow_wgcna * config$plot_panel_height, units = "in", device="pdf")
+    } else {
+      message("No module scores found or plotted.")
+    }
+  } else if (!config$hdwgcna_compute_module_scores) {
+    message("Skipping module score UMAP visualization as 'hdwgcna_compute_module_scores' is FALSE.")
+  } else if (!umap_reduction_name %in% names(seurat_obj@reductions)) {
+    message("Skipping module score UMAP visualization as UMAP reduction '", umap_reduction_name, "' is not present.")
+  }
+
+  message("hdWGCNA module visualization complete.")
+}
+
+
+# --- 5. Integration: GeneNMF Metaprograms and WGCNA Modules ---
+
+# 5a. Correlate Module Eigengenes with GeneNMF Metaprogram UCell Scores
+correlate_genenmf_hdwgcna <- function(seurat_obj, config) {
+  message("--- 5a. Correlating GeneNMF MPs (UCell Scores) with hdWGCNA Modules (MEs) ---")
+
+  # Find GeneNMF UCell score columns in metadata
+  ucell_score_suffix <- paste0("_", config$genenmf_ucell_suffix)
+  mp_trait_names <- grep(paste0(ucell_score_suffix, "$"), colnames(seurat_obj@meta.data), value = TRUE)
+
+  if (length(mp_trait_names) == 0) {
+    stop("GeneNMF Metaprogram UCell scores (ending with '", ucell_score_suffix, "') not found in Seurat metadata.")
+  }
+  message("Found ", length(mp_trait_names), " MP UCell scores to correlate.")
+
+  # Determine if using metacells or single cells for MEs based on stored info
+  metacell_ident <- seurat_obj@misc[[config$hdwgcna_name]]$metacell_ident
+  use_harmonized_mes <- !is.null(metacell_ident)
+
+  MEs <- GetMEs(seurat_obj, harmonized = use_harmonized_mes)
+  if (is.null(MEs) || nrow(MEs) == 0) {
+    stop("Module Eigengenes (MEs) could not be retrieved. Check hdWGCNA steps.")
+  }
+
+  # Prepare trait data (MP UCell scores) to match MEs (cells or metacells)
+  if (use_harmonized_mes) {
+    message("Aggregating MP UCell scores to metacell level (using ID: ", metacell_ident, ")...")
+    if (!metacell_ident %in% colnames(seurat_obj@meta.data)) {
+      stop("Metacell identifier '", metacell_ident, "' not found in Seurat metadata for aggregation.")
+    }
+    trait_data_agg <- seurat_obj@meta.data %>%
+      rownames_to_column("cell_id") %>% # Keep original cell ID temporarily if needed
+      dplyr::select(!!sym(metacell_ident), all_of(mp_trait_names)) %>%
+      group_by(!!sym(metacell_ident)) %>%
+      summarise(across(all_of(mp_trait_names), mean, na.rm = TRUE), .groups = "drop") %>% # Calculate mean UCell score per metacell
+      column_to_rownames(metacell_ident)
+
+    # Align trait data rows with ME rows (which should be metacell IDs)
+    common_ids <- intersect(rownames(MEs), rownames(trait_data_agg))
+     if(length(common_ids) == 0) {
+         stop("No common identifiers between MEs and aggregated trait data.")
+     }
+    message("Found ", length(common_ids), " common metacells for correlation.")
+    MEs <- MEs[common_ids, , drop = FALSE]
+    trait_data <- trait_data_agg[common_ids, , drop = FALSE]
+
+  } else {
+    message("Using single-cell MP UCell scores.")
+    trait_data <- seurat_obj@meta.data[, mp_trait_names, drop = FALSE]
+
+    # Align trait data rows with ME rows (which should be cell IDs)
+     common_ids <- intersect(rownames(MEs), rownames(trait_data))
+      if(length(common_ids) == 0) {
+          stop("No common cell identifiers between MEs and trait data.")
+      }
+     message("Found ", length(common_ids), " common cells for correlation.")
+     MEs <- MEs[common_ids, , drop = FALSE]
+     trait_data <- trait_data[common_ids, , drop = FALSE]
+  }
+
+  if(nrow(MEs) != nrow(trait_data)){
+      # This check should be redundant now due to common_ids intersection above
+      stop("Internal Error: Mismatch in number of observations between MEs (", nrow(MEs), ") and Trait data (", nrow(trait_data), ") after alignment.")
+  }
+  message("Dimensions match for correlation: ", nrow(MEs), " observations (cells/metacells).")
+
+  message("Computing module-trait correlations...")
+  # ModuleTraitCorrelation expects traits in the seurat_obj metadata,
+  # OR can be provided directly using the 'traits' argument.
+  # Let's use the 'traits' argument with the aligned 'trait_data'.
+  seurat_obj <- ModuleTraitCorrelation(
+    seurat_obj,
+    traits = trait_data,
+    MEs = MEs # Provide the aligned MEs as well
+    # group.by = NULL # Not needed when providing traits directly
+  )
+
+  message("Module-trait correlation complete.")
+  return(seurat_obj)
+}
+
+
+# 5b. Visualize Module-Trait Correlations
+# (Switched to PDF output, adjusted sizes)
+visualize_module_trait_corr <- function(seurat_obj, config) {
+  message("--- 5b. Visualizing Module-Trait Correlations ---")
+  plot_dir <- file.path(config$output_basedir, "plots", "integration")
+  if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+
+  corr_results <- GetModuleTraitCorrelation(seurat_obj)
+  if (is.null(corr_results) || is.null(corr_results$cor) || nrow(corr_results$cor) == 0) {
+    message("No module-trait correlation results found to plot.")
+    return()
+  }
+
+  message("Generating module-trait correlation heatmap...")
+  # Clean up trait names (remove suffix) for plotting
+  trait_names_clean <- sub(paste0("_", config$genenmf_ucell_suffix, "$"), "", colnames(corr_results$corP)) # Use corP as it should have final names
+
+  # Adjust text size for labels within the heatmap
+  corr_text_size = 2.0 # Smaller text for p-values/stars
+
+  corr_plot <- PlotModuleTraitCorrelation(
+    seurat_obj,
+    label = 'p.value',
+    label_symbol = 'stars',
+    text_size = corr_text_size,
+    text_digits = 2,
+    text_color = 'black',
+    high_color = config$integration_plot_high_color,
+    mid_color = config$integration_plot_mid_color,
+    low_color = config$integration_plot_low_color,
+    plot_max = config$integration_plot_corr_max,
+    plot_min = -config$integration_plot_corr_max, # Symmetrical range
+    legend_position = 'top',
+    legend_title = "Correlation",
+    trait_names = trait_names_clean # Provide cleaned names
+  ) + ggtitle("hdWGCNA Module - GeneNMF MP Correlation") +
+    theme(axis.text.x = element_text(angle = 45, hjust=1, size=config$plot_fontsize_small), # Smaller axis text
+          axis.text.y = element_text(size=config$plot_fontsize_small), # Smaller axis text
+          plot.title = element_text(hjust = 0.5, size=config$plot_fontsize_large),
+          legend.title = element_text(size=config$plot_fontsize_small),
+          legend.text = element_text(size=config$plot_fontsize_tiny))
+
+  print(corr_plot)
+  n_mods <- nrow(corr_results$cor)
+  n_traits <- ncol(corr_results$cor)
+  # Adjust size based on number of rows/cols
+  plot_width <- max(3.5, n_traits * 0.4 + 1.5) # Base width + per trait width
+  plot_height <- max(3, n_mods * 0.25 + 1.5) # Base height + per module height
+  ggsave(file.path(plot_dir, "hdwgcna_genenmf_correlation_heatmap.pdf"), corr_plot,
+         width = plot_width, height = plot_height, units = "in", device = "pdf", limitsize = FALSE)
+
+  message("Module-trait correlation visualization complete.")
+}
+
+
+
+# --- 6. Specific Gene Analysis ---
+# *** Use LayerData for v5 compatibility ***
+analyze_gene_genenmf_relationship <- function(seurat_obj, mp_genes, config) {
+  gene_of_interest <- config$analyze_gene_name
+  if (is.null(gene_of_interest) || gene_of_interest == "") {
+    message("--- 6. Skipping Specific Gene Analysis (no gene specified) ---")
+    return()
+  }
+  message("--- 6. Analyzing Relationship of Gene: ", gene_of_interest, " with GeneNMF Metaprograms ---")
+  plot_dir <- file.path(config$output_basedir, "plots", "gene_analysis", gene_of_interest)
+  if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+
+  # Find assay containing the gene
+  gene_found_in_assays <- FALSE
+  target_assay_for_expr <- DefaultAssay(seurat_obj) %||% names(seurat_obj@assays)[1] # Use default or first assay
+  if (!gene_of_interest %in% rownames(seurat_obj[[target_assay_for_expr]])) {
+      assay_list_for_gene_check <- names(seurat_obj@assays)
+      for (assay_name in assay_list_for_gene_check) {
+        # Check rownames of the assay object itself for v5
+        if (gene_of_interest %in% rownames(seurat_obj[[assay_name]])) {
+          target_assay_for_expr <- assay_name
+          gene_found_in_assays <- TRUE
+          message("Gene '", gene_of_interest, "' found in assay: ", target_assay_for_expr)
+          break
+        }
+      }
+  } else {
+       gene_found_in_assays <- TRUE
+       message("Gene '", gene_of_interest, "' found in default assay: ", target_assay_for_expr)
+  }
+
+
+  if (!gene_found_in_assays) {
+    warning("Gene '", gene_of_interest, "' not found in any assay of the Seurat object. Skipping analysis.")
+    return()
+  }
+
+  # 6a. Check Gene Presence in Metaprograms
+  message("Checking presence in top genes of Metaprograms...")
+  gene_presence_in_mp <- sapply(names(mp_genes), function(mp_name) {
+       top_n_genes <- head(mp_genes[[mp_name]], n = config$genenmf_max_genes) # Check within max genes used
+       gene_of_interest %in% top_n_genes
+  })
+
+  present_in <- names(which(gene_presence_in_mp))
+  if(length(present_in) > 0) {
+      message("Gene '", gene_of_interest, "' found among top ", config$genenmf_max_genes, " genes of MPs: ", paste(present_in, collapse=", "))
+      # Optional: report rank?
+      ranks <- sapply(present_in, function(mp_name) which(mp_genes[[mp_name]] == gene_of_interest))
+      print(paste("Ranks in respective MPs:", paste(names(ranks), ranks, sep=": ", collapse="; ")))
+
+  } else {
+      message("Gene '", gene_of_interest, "' not found among top ", config$genenmf_max_genes, " genes of any Metaprogram.")
+  }
+  # Save presence info
+   presence_df <- data.frame(Metaprogram=names(gene_presence_in_mp), IsPresent=gene_presence_in_mp, row.names=names(gene_presence_in_mp))
+   write.csv(presence_df, file.path(plot_dir, paste0(gene_of_interest, "_genenmf_presence_in_mps.csv")))
+
+
+  # 6b. Analyze Expression Correlation (vs MP UCell Activity)
+  message("Analyzing correlation with Metaprogram UCell activity...")
+  # Find UCell score columns
+  ucell_score_suffix <- paste0("_", config$genenmf_ucell_suffix)
+  mp_score_colnames <- grep(paste0(ucell_score_suffix, "$"), colnames(seurat_obj@meta.data), value = TRUE)
+
+  if(length(mp_score_colnames) == 0) {
+      warning("No MP UCell scores found in metadata. Skipping correlation analysis.")
+      return()
+  }
+
+  # Get gene expression using LayerData for v5 compatibility
+  gene_expression_layer <- "data" # Assume normalized data is in 'data' layer
+   if (!gene_expression_layer %in% Layers(seurat_obj, assay = target_assay_for_expr)) {
+       warning("Layer '", gene_expression_layer, "' not found in assay '", target_assay_for_expr, "'. Trying 'counts'.")
+       gene_expression_layer <- "counts"
+       if (!gene_expression_layer %in% Layers(seurat_obj, assay = target_assay_for_expr)) {
+           warning("Layer '", gene_expression_layer, "' also not found. Skipping correlation.")
+           return()
+       }
+   }
+   # Use LayerData to extract expression
+   gene_expr_matrix <- LayerData(seurat_obj, assay = target_assay_for_expr, layer = gene_expression_layer)
+   # Check if gene exists in the extracted matrix (should match the earlier check)
+   if (!gene_of_interest %in% rownames(gene_expr_matrix)) {
+        warning("Gene '", gene_of_interest, "' not found in layer '", gene_expression_layer, "' of assay '", target_assay_for_expr, "' after LayerData call. Skipping correlation.")
+        return()
+   }
+   gene_expression <- gene_expr_matrix[gene_of_interest, ]
+
+
+  program_scores <- seurat_obj@meta.data[, mp_score_colnames, drop = FALSE]
+
+  # Ensure alignment between expression and scores (should be aligned by cell names)
+  common_cells <- intersect(names(gene_expression), rownames(program_scores))
+  if(length(common_cells) < 2) { # Need at least 2 cells for correlation
+       warning("Fewer than 2 common cells between gene expression and program scores. Skipping correlation.")
+       return()
+  }
+  gene_expression <- gene_expression[common_cells]
+  program_scores <- program_scores[common_cells, , drop = FALSE]
+
+
+  correlations <- apply(program_scores, 2, function(activity) {
+    # Check for sufficient variation before calculating correlation
+    if (sd(activity, na.rm=TRUE) == 0 || sd(gene_expression, na.rm=TRUE) == 0 || sum(complete.cases(gene_expression, activity)) < 3) return(NA)
+    cor(gene_expression, activity, method = "spearman", use="complete.obs")
+  })
+  correlations[is.na(correlations)] <- 0
+
+  correlation_df <- data.frame(
+    Program_Score = names(correlations),
+    Correlation = correlations
+  ) %>%
+    mutate(Program = sub(ucell_score_suffix, "", Program_Score)) %>% # Clean name for plotting
+    mutate(Program = factor(Program, levels = Program[order(abs(Correlation), decreasing = TRUE)])) # Order by absolute correlation
+
+  p_correlation <- ggplot(correlation_df, aes(x = Program, y = Correlation, fill = Correlation)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient2(low = config$integration_plot_low_color, mid = config$integration_plot_mid_color, high = config$integration_plot_high_color, midpoint = 0, name = "Spearman\nCorr.") +
+    theme_minimal(base_size = config$plot_base_fontsize) + # Use smaller base font
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size=rel(0.9)),
+          plot.title = element_text(hjust = 0.5, size=rel(1.1)),
+          legend.title = element_text(size=rel(0.8)),
+          legend.text = element_text(size=rel(0.7))) +
+    labs(title = paste("Correlation:", gene_of_interest, "Expression vs. MP UCell Activity"),
+         x = "GeneNMF Metaprogram", y = "Spearman Correlation") +
+    geom_hline(yintercept = 0, linetype="dashed", color="grey50")
+  print(p_correlation)
+  # Adjust size based on number of programs
+  corr_plot_width <- max(3.5, length(levels(correlation_df$Program)) * 0.4 + 1.5)
+  ggsave(file.path(plot_dir, paste0(gene_of_interest, "_genenmf_ucell_correlation.pdf")), p_correlation,
+         width = corr_plot_width, height = 4, units = "in", device = "pdf")
+
+
+  # 6c. UMAP Visualization (Check if UMAP exists)
+  # Determine UMAP reduction name to use
+  umap_reduction_name <- config$seurat_input_umap_name %||% "umap"
+
+  if (umap_reduction_name %in% names(seurat_obj@reductions)) {
+    message("Generating comparative UMAP plots...")
+    # Find program with highest absolute correlation
+     top_abs_corr_program_score <- correlation_df %>%
+         filter(!is.na(Correlation)) %>%
+         arrange(desc(abs(Correlation))) %>%
+         slice(1) %>% pull(Program_Score) %>% as.character()
+
+    plot_list_gene <- list()
+
+    # FeaturePlot should handle v5 layers correctly when specifying the feature name
+    p_gene_umap <- FeaturePlot(seurat_obj, features = gene_of_interest, coord.fixed = TRUE, pt.size = config$plot_umap_pt_size, reduction = umap_reduction_name, order=TRUE) + # Removed assay spec, let FeaturePlot find it
+      scale_colour_viridis(option="magma", name=paste(gene_of_interest)) + ggtitle(paste(gene_of_interest, "Expr.")) +
+      theme_bw(base_size = config$plot_base_fontsize) + # Smaller font
+      theme(plot.title = element_text(hjust = 0.5, size = rel(1.0)), # Adjust title size
+            axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),
+            legend.title = element_text(size=rel(0.8)), legend.text=element_text(size=rel(0.7))) # Smaller legend
+    plot_list_gene[[gene_of_interest]] <- p_gene_umap
+
+     if(length(top_abs_corr_program_score) > 0 && top_abs_corr_program_score %in% colnames(seurat_obj@meta.data)) {
+         top_program_name_clean <- sub(ucell_score_suffix,"",top_abs_corr_program_score)
+         p_top_corr_umap <- FeaturePlot(seurat_obj, features = top_abs_corr_program_score, coord.fixed = TRUE, pt.size = config$plot_umap_pt_size, reduction = umap_reduction_name, order=TRUE) +
+             scale_colour_viridis(option="plasma", name=top_program_name_clean) + ggtitle(paste("Highest Corr. MP")) +
+             theme_bw(base_size = config$plot_base_fontsize) + # Smaller font
+             theme(plot.title = element_text(hjust = 0.5, size = rel(1.0)), # Adjust title size
+                   axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(),
+                   legend.title = element_text(size=rel(0.8)), legend.text=element_text(size=rel(0.7))) # Smaller legend
+         plot_list_gene[[top_abs_corr_program_score]] <- p_top_corr_umap
+         plot_title <- paste(gene_of_interest, "Expression vs Highest Correlated Metaprogram (", top_program_name_clean,")")
+         ncol_gene <- 2
+     } else {
+         message("Could not find program with highest correlation for UMAP comparison.")
+         plot_title <- paste(gene_of_interest, "Expression")
+         ncol_gene <- 1
+     }
+
+    combined_umap <- wrap_plots(plot_list_gene, ncol = ncol_gene) + plot_annotation(title=plot_title) & theme(plot.title = element_text(hjust = 0.5, size=rel(0.9)))
+    print(combined_umap)
+    ggsave(file.path(plot_dir, paste0(gene_of_interest, "_genenmf_umaps_comparison.pdf")), combined_umap,
+           width = ncol_gene * config$plot_panel_width, height = config$plot_panel_height, units = "in", device="pdf")
+  } else {
+    message("UMAP reduction '", umap_reduction_name, "' not found, skipping comparative UMAP plots for gene analysis.")
+  }
+
+
+  # 6d. Scatter Plot (Optional)
+  message("Generating scatter plot...")
+  target_program_score_for_scatter <- correlation_df %>%
+      filter(!is.na(Correlation)) %>%
+      arrange(desc(abs(Correlation))) %>%
+      slice(1) %>% pull(Program_Score) %>% as.character()
+
+  if (length(target_program_score_for_scatter) > 0 &&
+      target_program_score_for_scatter %in% colnames(seurat_obj@meta.data) &&
+      config$celltype_col %in% colnames(seurat_obj@meta.data))
+  {
+    # Use the already aligned gene_expression and program_scores
+    scatter_data <- data.frame(
+      GeneExpr = gene_expression, # Already subsetted to common_cells
+      ProgramActivity = program_scores[[target_program_score_for_scatter]], # Already subsetted to common_cells
+      Celltype = seurat_obj@meta.data[common_cells, config$celltype_col] # Subset metadata
+    )
+
+    if (nrow(scatter_data) > config$gene_analysis_scatter_max_cells) {
+      set.seed(123)
+      scatter_data <- sample_n(scatter_data, config$gene_analysis_scatter_max_cells)
+      plot_subtitle <- paste("(Sampled", config$gene_analysis_scatter_max_cells, "cells)")
+    } else {
+      plot_subtitle <- NULL
+    }
+
+    celltype_levels <- levels(factor(seurat_obj@meta.data[[config$celltype_col]]))
+    if (length(celltype_levels) == 0) celltype_levels <- unique(seurat_obj@meta.data[[config$celltype_col]]) # Fallback
+    celltype_colors <- scales::hue_pal()(length(celltype_levels))
+    names(celltype_colors) <- celltype_levels
+
+    target_program_name <- sub(ucell_score_suffix, "", target_program_score_for_scatter)
+    p_scatter <- ggplot(scatter_data, aes(x = ProgramActivity, y = GeneExpr, color = Celltype)) +
+      geom_point(alpha = 0.5, size = 0.5) + # Smaller points
+      geom_smooth(method = "gam", se = FALSE, color = "black", linetype = "dashed", size = 0.5, aes(group=1)) + # Add overall trend
+      scale_color_manual(values = celltype_colors, name="Cell Type") +
+      theme_bw(base_size = config$plot_base_fontsize) + # Smaller base font
+      labs(title = paste(gene_of_interest, "Expression vs.", target_program_name, "Activity"),
+           subtitle = plot_subtitle,
+           x = paste(target_program_name, "UCell Score"),
+           y = paste(gene_of_interest, "Expression (", gene_expression_layer, ")")) + # Indicate layer used
+      theme(plot.title = element_text(hjust = 0.5, size=rel(1.1)),
+            plot.subtitle = element_text(hjust = 0.5, size=rel(0.9)),
+            legend.title = element_text(size=rel(0.8)),
+            legend.text = element_text(size=rel(0.7)),
+            legend.key.size = unit(0.8, "lines")) + # Smaller legend keys
+      guides(color = guide_legend(override.aes = list(size=2))) # Make legend points larger
+
+    print(p_scatter)
+    ggsave(file.path(plot_dir, paste0(gene_of_interest, "_vs_", target_program_name, "_scatter.pdf")), p_scatter,
+           width = 4.5, height = 4, units = "in", device = "pdf") # Adjust size
+  } else if (!config$celltype_col %in% colnames(seurat_obj@meta.data)) {
+    message("Skipping scatter plot as cell type column '", config$celltype_col, "' not found.")
+  } else {
+    message("No program score found or no correlation found for scatter plot.")
+  }
+
+  message("Specific gene analysis for '", gene_of_interest, "' complete.")
+}
+
+
+# --- 7. Main Workflow Execution ---
+run_pipeline <- function(config) {
+  message("========================================")
+  message("Starting GeneNMF-hdWGCNA Integration Pipeline")
+  message("Time: ", Sys.time())
+  message("Output directory: ", normalizePath(config$output_basedir))
+  if (!dir.exists(config$output_basedir)) dir.create(config$output_basedir, recursive = TRUE)
+  message("========================================")
+
+  # Create plots directory if it doesn't exist
+  plot_base_dir <- file.path(config$output_basedir, "plots")
+   if (!dir.exists(plot_base_dir)) dir.create(plot_base_dir, recursive = TRUE)
+
+
+  load_libraries()
+  # Setup analysis, returns object and potentially updated config (e.g., genenmf_slot)
+  setup_results <- setup_analysis(config)
+  seurat_obj <- setup_results$seurat_obj
+  config <- setup_results$config # Use potentially updated config
+  saveRDS(seurat_obj, file.path(config$output_basedir, "seurat_object_step1_setup.rds"))
+
+  # Step 2a: Run GeneNMF and get MPs + UCell scores
+  genenmf_results <- run_genenmf(seurat_obj, config)
+  seurat_obj <- genenmf_results$seurat_obj # Object now has UCell scores
+  metaprograms_obj <- genenmf_results$metaprograms # Raw GeneNMF MP object
+  mp_genes <- genenmf_results$mp_genes # List of genes per MP
+  H_matrix_ucell <- genenmf_results$H_matrix_ucell # Matrix of scores
+  config <- genenmf_results$config # Get potentially updated config back
+  saveRDS(seurat_obj, file.path(config$output_basedir, "seurat_object_step2a_genenmf_scored.rds"))
+  # metaprograms_obj is saved within run_genenmf using qsave
+  saveRDS(mp_genes, file.path(config$output_basedir, "genenmf_mp_genes_list.rds"))
+  saveRDS(H_matrix_ucell, file.path(config$output_basedir, "genenmf_H_matrix_ucell_scores.rds"))
+
+  # Step 2b: Visualize GeneNMF Results
+  visualize_genenmf_results(seurat_obj, metaprograms_obj, H_matrix_ucell, config)
+
+  # Step 3a: Run Functional Enrichment (fgsea/enricher) on GeneNMF MPs
+  enrichment_results <- run_fgsea_on_genenmf(mp_genes, seurat_obj, config)
+  saveRDS(enrichment_results, file.path(config$output_basedir, "functional_enrichment_results_list.rds"))
+
+  # Step 3b: Visualize Enrichment Results
+  visualize_enrichment_results(enrichment_results, config)
+
+  # Step 4a: Setup hdWGCNA
+  seurat_obj <- setup_hdwgcna(seurat_obj, config)
+  # --- MANUAL Soft Power SELECTION POINT ---
+  if (is.null(config$hdwgcna_soft_power)) {
+    message("\n>>> PAUSE: Examine the soft power plots generated in ",
+            file.path(config$output_basedir, "plots", "hdwgcna"))
+    message(">>> Set 'hdwgcna_soft_power' in the 'config' list below and then re-run the script from this point,")
+    message(">>> or set it in your interactive session and continue step-by-step.")
+    stop("Please set 'hdwgcna_soft_power' in the configuration before proceeding.")
+  }
+  message("Continuing with soft power = ", config$hdwgcna_soft_power)
+  # --- END MANUAL POINT ---
+  saveRDS(seurat_obj, file.path(config$output_basedir, "seurat_object_step4a_hdwgcna_setup.rds"))
+
+  # Step 4b: Run hdWGCNA Network Construction
+  seurat_obj <- run_hdwgcna_network(seurat_obj, config)
+  saveRDS(seurat_obj, file.path(config$output_basedir, "seurat_object_step4b_hdwgcna_network.rds"))
+
+  # Step 4c: Visualize hdWGCNA Modules
+  visualize_hdwgcna_modules(seurat_obj, config)
+
+  # Step 5a: Correlate GeneNMF MPs and WGCNA Modules
+  seurat_obj <- correlate_genenmf_hdwgcna(seurat_obj, config)
+  saveRDS(seurat_obj, file.path(config$output_basedir, "seurat_object_step5a_integration_corr.rds"))
+  corr_data <- GetModuleTraitCorrelation(seurat_obj)
+  saveRDS(corr_data, file.path(config$output_basedir, "genenmf_hdwgcna_correlation_results.rds"))
+
+  # Step 5b: Visualize Module-Trait Correlations
+  visualize_module_trait_corr(seurat_obj, config)
+
+  # Step 6: Specific Gene Analysis (if gene specified)
+  analyze_gene_genenmf_relationship(seurat_obj, mp_genes, config) # Pass mp_genes list
+
+  message("========================================")
+  message("Pipeline execution finished successfully!")
+  message("Time: ", Sys.time())
+  message("Final Seurat object saved in: ", config$output_basedir)
+  message("========================================")
+
+  return(seurat_obj) # Return the final object
+}
+
+
+# --- Configuration ---
+# Define all parameters in a list for easy management
+library(rlang) # Ensure rlang is loaded for %||%
+
+config <- list(
+  # Input/Output
+  input_data_path = "path/to/your/data.rds", # <<< USER: Set path to your input RDS file (SCE or Seurat)
+  input_is_seurat_object = FALSE, # <<< USER: Set TRUE if input_data_path points to a pre-processed Seurat object, FALSE if it's an SCE object needing preprocessing.
+  output_basedir = "./genenmf_hdwgcna_pipeline_output_pdf", # Base directory for all outputs
+  celltype_col = "celltype", # <<< USER: Column name in metadata with cell type annotations
+
+  # Input Seurat Object Specifics (Only used if input_is_seurat_object = TRUE)
+  seurat_input_pca_name = "pca", # <<< USER: Name of the PCA reduction in the input Seurat object
+  seurat_input_umap_name = "umap", # <<< USER: Name of the UMAP reduction in the input Seurat object
+
+  # Seurat Preprocessing (Only used if input_is_seurat_object = FALSE)
+  seurat_n_hvgs = 2000, # Number of highly variable genes
+  seurat_n_pcs = 30, # Number of principal components
+  seurat_umap_dims = 30, # Number of PCs to use for UMAP
+
+  # GeneNMF Parameters
+  genenmf_split_by = NULL, # <<< USER: Metadata column to split samples for multiNMF (e.g., "orig.ident"), or NULL to run on whole dataset
+  genenmf_assay = "RNA",    # <<< USER: Assay to use for GeneNMF (ensure it exists)
+  genenmf_slot = "data",    # <<< USER: Layer (v5) or Slot (pre-v5) within the assay for GeneNMF (e.g., "data" for log-normalized)
+  genenmf_k_range = 4:9,  # <<< USER: Set K range to test in multiNMF
+  genenmf_n_features = 1000, # <<< USER: Number of features for GeneNMF (e.g., 1000 based on HVGs). Set to NULL or 0 to use all features.
+  genenmf_nMP = 10,       # <<< USER: Desired number of final Metaprograms (adjust based on results)
+  genenmf_weight_explained = 0.7, # Parameter for getMetaPrograms
+  genenmf_max_genes = 100,    # Max genes per final Metaprogram
+  genenmf_ucell_suffix = "UCell", # Suffix added to MP names for UCell scores
+  genenmf_num_workers = 4,    # Number of cores for UCell scoring
+
+  # GeneNMF Visualization
+  genenmf_num_umap_plots = 9, # Max number of MP score UMAPs to generate
+  genenmf_heatmap_ncells = 2000, # Max number of cells for MP score heatmap
+  genenmf_num_top_genes_list = 20, # Number of top genes per MP to list in output file
+
+  # Functional Enrichment Parameters (fgsea/enricher)
+  gsea_species = "Homo sapiens", # <<< USER: Set species ("Homo sapiens" or "Mus musculus", etc.)
+  gsea_categories = "H,C5", # <<< USER: Comma-separated MSigDB categories (e.g., "H", "C5", "C2", "C7")
+  gsea_subcategories = "GO:BP", # <<< USER: Comma-separated subcategories if needed (e.g., "GO:BP", "CP:KEGG", NULL)
+  fgsea_pval_cutoff = 0.05, # p-value cutoff for enricher function
+  fgsea_min_geneset_size = 10,
+  fgsea_max_geneset_size = 500,
+  fgsea_min_program_genes = 5, # Min number of program genes in universe to run enrichment
+
+  # Enrichment Visualization
+  enrichment_plot_fdr_cutoff = 0.05, # Adjusted p-value cutoff for plotting results
+  enrichment_plot_top_n_terms = 5, # Max number of top terms per program to show in dot plot
+
+  # hdWGCNA Parameters
+  hdwgcna_name = "GeneNMF_integration", # Name for the hdWGCNA analysis within Seurat object
+  hdwgcna_gene_select_method = "variable", # "variable", "custom", etc.
+  hdwgcna_custom_features = NULL, # Provide gene vector if method is "custom"
+  hdwgcna_assay_for_wgcna = "RNA", # <<< USER: Assay for hdWGCNA. **RECOMMEND 'RNA' for v5 compatibility**
+  hdwgcna_layer_for_wgcna = "data", # <<< USER: Layer for hdWGCNA. **RECOMMEND 'data' (log-norm) for v5 compatibility**
+  hdwgcna_group_name = NULL, # Name for the group being analyzed (often set automatically)
+  hdwgcna_group.by = "celltype", # <<< USER: Metadata column to group cells for network construction (can be NULL for global)
+  hdwgcna_network_type = "signed", # 'signed', 'unsigned', 'signed hybrid'
+  hdwgcna_min_rsquared = 0.8, # Minimum R^2 for soft power selection guidance
+  hdwgcna_soft_power = NULL, # <<< USER: Set this AFTER running setup_hdwgcna and checking soft power plots
+  hdwgcna_tom_name = "GeneNMF_TOM", # Name for the TOM file/matrix
+  hdwgcna_compute_module_scores = TRUE, # Whether to compute UCell scores for visualization
+  hdwgcna_module_score_n_genes = 25, # Number of genes for module scoring
+
+  # hdWGCNA Metacells (Optional)
+  hdwgcna_use_metacells = TRUE, # <<< USER: Set TRUE to use metacells, FALSE for single cells
+  hdwgcna_metacell_group_by = c("celltype"), # <<< USER: Metadata column(s) to group for metacells
+  hdwgcna_metacell_k = 25, # Number of neighbors for metacell construction
+  hdwgcna_metacell_max_shared = 12, # Max shared neighbors for metacell construction
+  hdwgcna_metacell_ident = "metacell_id", # <<< USER: Name for the new metadata column holding metacell IDs
+
+  # hdWGCNA Visualization
+  hdwgcna_num_umap_plots = 9, # Max number of module score UMAPs to generate
+
+  # Integration Visualization
+  integration_plot_high_color = "#D73027", # Red
+  integration_plot_mid_color = "#FFFFFF", # White
+  integration_plot_low_color = "#4575B4", # Blue
+  integration_plot_corr_max = 0.8, # Max absolute correlation for color scale
+
+  # Specific Gene Analysis
+  analyze_gene_name = NULL, # <<< USER: Set a gene symbol (e.g., "RAPGEF3") or NULL to skip
+  gene_analysis_scatter_max_cells = 5000, # Max cells for gene scatter plot
+
+  # Plotting Parameters (Publication Quality Focus)
+  plot_base_fontsize = 8,     # Base font size for ggplot themes (adjust as needed)
+  plot_fontsize_large = 10,   # Larger font size (e.g., main titles)
+  plot_fontsize_medium = 8,   # Medium font size (e.g., axis titles, heatmap titles)
+  plot_fontsize_small = 7,    # Small font size (e.g., axis text, legend titles)
+  plot_fontsize_tiny = 6,     # Tiny font size (e.g., heatmap labels, legend text)
+  plot_umap_width = 3.5,      # Approx width for single UMAP panel (inches) - ~single column
+  plot_umap_height = 3.5,     # Approx height for single UMAP panel (inches)
+  plot_panel_width = 2.8,     # Approx width per panel in multi-panel plots (inches)
+  plot_panel_height = 2.8,    # Approx height per panel in multi-panel plots (inches)
+  plot_umap_pt_size = 0.1     # Point size for UMAP plots
+)
+
+
+# --- Execute Pipeline ---
+# It's recommended to run this in stages due to the manual soft power selection step.
+# Stage 1: Run up to the first pause point after `setup_hdwgcna`.
+# Stage 2: Set the required `hdwgcna_soft_power` in the config list above (or in your session).
+# Stage 3: Then uncomment and run the main execution function `run_pipeline(config)`
+#          OR run the remaining steps interactively.
+
+# # Example of setting specific parameters before running:
+config$input_data_path='RAPGEF3_cells.rds'
+config$input_is_seurat_object=TRUE
+config$seurat_input_pca_name='Standardpca'
+config$seurat_input_umap_name='StandardUMAP2D'
+config$celltype_col='new_celltype'
+config$output_basedir='GeneNMF_hdWGCNA_Output_PDF' # Changed output dir name
+config$genenmf_assay = "RNA"
+config$genenmf_slot = "data"
+config$genenmf_k_range = 5:15
+config$genenmf_nMP = 12
+config$genenmf_n_features = 2000
+config$genenmf_split_by = NULL # Run on whole dataset
+config$hdwgcna_assay_for_wgcna = "RNA" # <<< Ensure this is RNA for v5
+config$hdwgcna_layer_for_wgcna = "data" # <<< Ensure this is data for v5
+config$hdwgcna_group.by = "new_celltype"
+config$hdwgcna_use_metacells = FALSE
+config$analyze_gene_name = 'RAPGEF3'
+config$hdwgcna_soft_power = 6 # <<< SET THIS AFTER CHECKING PLOT in Stage 1
+
+# # After setting all config parameters:
+# # Run the pipeline (remember the pause for soft power)
+final_seurat_object <- run_pipeline(config) # <<< UNCOMMENT THIS LINE TO RUN

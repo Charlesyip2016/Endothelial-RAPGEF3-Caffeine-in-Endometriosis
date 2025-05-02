@@ -1,0 +1,436 @@
+#' Run Spatial Transcriptomics Analysis Workflow
+#'
+#' This function performs Seurat preprocessing, RCTD deconvolution (doublet mode),
+#' and mistyR analysis on 10X Visium data.
+#'
+#' @param data_dir Path to the directory containing 10X Spatial data
+#'   (e.g., 'FX0028/UA_HUTER_sp_10879894/'). Should contain
+#'   'filtered_feature_bc_matrix.h5' and spatial data.
+#' @param ref_path Path to the single-cell reference Seurat object (RDS file).
+#'   Expected to have an 'RNA' assay and 'updated_celltype' metadata column.
+#' @param output_dir Path to the directory where results (RDS object, plots)
+#'   will be saved. Will be created if it doesn't exist.
+#' @param sample_name A character string name for the sample (e.g., "FX0028")
+#'   used for naming output files.
+#' @param target_gene The primary gene of interest for mistyR analysis
+#'   (default: "RAPGEF3").
+#' @param cell_type_mapping A named list mapping generic types to exact names
+#'   in the reference 'updated_celltype' column. Used for creating mistyR
+#'   indicator variables from RCTD 'first_type'/'second_type'.
+#'   Default uses names provided previously by the user.
+#' @param misty_l_param The 'l' parameter (neighborhood radius) for
+#'   mistyR::add_paraview (default: 10).
+#' @param misty_cutoff_intra The cutoff for mistyR intraview heatmap
+#'   (default: 0.5).
+#' @param misty_cutoff_para The cutoff for mistyR paraview and contrast
+#'   heatmaps (default: 0.3).
+#' @param n_cores Number of cores for parallel processing via 'future'
+#'   (default: max(1, future::availableCores() - 2)).
+#' @param rctd_cores Number of cores specifically for RCTD (default: 4).
+#' @param sct_assay Name of the assay resulting from SCTransform (default: "SCT").
+#' @param rna_assay Name of the initial assay holding counts (default: "Spatial").
+#' @param ref_ident_col Name of the column in the reference metadata holding
+#'   cell type labels (default: "updated_celltype").
+#' @param ref_counts_col Name of the column in the reference metadata holding
+#'   total counts/UMI (default: "nCount_RNA").
+#'
+#' @return Invisibly returns the path to the saved final Seurat object RDS file,
+#'   or NULL if an error occurred. Saves mistyR plots to the output directory.
+#'
+#' @examples
+#' \dontrun{
+#' run_spatial_analysis(
+#'   data_dir = "path/to/spatial_data_folder/",
+#'   ref_path = "path/to/reference_sce.rds",
+#'   output_dir = "results/sample_X/",
+#'   sample_name = "SampleX",
+#'   target_gene = "MY_GENE",
+#'   cell_type_mapping = list(
+#'     Myeloid = "Immune_Myeloid", # Replace with your exact names
+#'     Arterial_Pos = "Arterial_Type1",
+#'     Arterial_Neg = "Arterial_Type2",
+#'     Venous_Pos = "Venous_Type1",
+#'     Venous_Neg = "Venous_Type2"
+#'   )
+#' )
+#' }
+run_spatial_analysis <- function(data_dir,
+                                 ref_path,
+                                 output_dir,
+                                 sample_name,
+                                 target_gene = "RAPGEF3",
+                                 cell_type_mapping = list(
+                                     Myeloid = "Immune_Myeloid",
+                                     Arterial_Pos = "Arterial_Endo_RAPGEF3+SELP+",
+                                     Arterial_Neg = "Arterial_RAPGEF3-_Cells",
+                                     Venous_Pos = "Venous_Endo_RAPGEF3+SELP-",
+                                     Venous_Neg = "Venous_RAPGEF3-_Cells"
+                                 ),
+                                 misty_l_param = 10,
+                                 misty_cutoff_intra = 0.5,
+                                 misty_cutoff_para = 0.3,
+                                 n_cores = max(1, future::availableCores() - 2),
+                                 rctd_cores = 4,
+                                 sct_assay = "SCT",
+                                 rna_assay = "Spatial",
+                                 ref_ident_col = "updated_celltype",
+                                 ref_counts_col = "nCount_RNA"
+                                 ) {
+
+    # --- 0. Load Libraries & Setup ---
+    message("--- Loading Libraries ---")
+    suppressPackageStartupMessages({
+        library(Seurat)
+        library(mistyR)
+        library(dplyr)
+        library(tidyr)
+        library(distances)
+        library(ggplot2)
+        library(future)
+        library(patchwork)
+        library(Matrix)
+        library(SpatialExperiment)
+        library(SingleCellExperiment)
+        library(spacexr) # For RCTD
+        library(tidyverse)
+    })
+
+    # Setup parallel processing
+    message(paste("Setting up parallel processing with", n_cores, "cores."))
+    plan(multisession, workers = n_cores)
+    options(future.globals.maxSize = 2 * 1024^3) # Increase if data is large
+    options(stringsAsFactors = FALSE)
+
+    # Create output directory if it doesn't exist
+    if (!dir.exists(output_dir)) {
+        message(paste("Creating output directory:", output_dir))
+        dir.create(output_dir, recursive = TRUE)
+    }
+
+    # --- 1. Load Spatial Data & Preprocess ---
+    message(paste("--- Loading Spatial Data for Sample:", sample_name, "---"))
+    h5_file <- file.path(data_dir, 'filtered_feature_bc_matrix.h5')
+    if (!file.exists(h5_file)) {
+        stop(paste("H5 file not found at:", h5_file))
+    }
+    tryCatch({
+        seu_obj <- Load10X_Spatial(data.dir = data_dir, filename = basename(h5_file), assay = rna_assay)
+    }, error = function(e) {
+        stop(paste("Error loading spatial data:", e$message))
+    })
+
+    message("--- Running Seurat Preprocessing (SCTransform, PCA, UMAP, Clustering) ---")
+    tryCatch({
+        seu_obj <- SCTransform(seu_obj, assay = rna_assay, verbose = FALSE)
+        seu_obj <- RunPCA(seu_obj, assay = sct_assay, npcs = 30, features = rownames(seu_obj[[sct_assay]]), verbose = FALSE)
+        seu_obj <- RunUMAP(seu_obj, reduction = "pca", dims = 1:30, verbose = FALSE)
+        seu_obj <- FindNeighbors(seu_obj, reduction = "pca", dims = 1:30, verbose = FALSE)
+        seu_obj <- FindClusters(seu_obj, resolution = 0.8, verbose = FALSE)
+    }, error = function(e) {
+        stop(paste("Error during Seurat preprocessing:", e$message))
+    })
+    message("Seurat preprocessing complete.")
+
+    # --- 2. Load Reference & Run RCTD ---
+    message("--- Loading Single-Cell Reference for RCTD ---")
+    if (!file.exists(ref_path)) {
+        stop(paste("Reference RDS file not found at:", ref_path))
+    }
+    tryCatch({
+        ref_seu <- readRDS(ref_path)
+        # Ensure it's a Seurat object and has necessary info
+        if (!inherits(ref_seu, "Seurat")) {
+             # Try converting if it's e.g., SingleCellExperiment
+             if (inherits(ref_seu, "SingleCellExperiment")) {
+                ref_seu <- as.Seurat(ref_seu, counts = "counts", data = "logcounts") # Adjust slots if needed
+             } else {
+                stop("Reference file is not a Seurat object or SingleCellExperiment.")
+             }
+        }
+        # Make sure RNA assay and metadata columns exist
+        if (!"RNA" %in% names(ref_seu@assays)) stop("Reference Seurat object must contain an 'RNA' assay.")
+        if (!ref_ident_col %in% colnames(ref_seu@meta.data)) stop(paste("Reference metadata missing column:", ref_ident_col))
+        if (!ref_counts_col %in% colnames(ref_seu@meta.data)) stop(paste("Reference metadata missing column:", ref_counts_col))
+
+        # Prepare RCTD Reference object
+        ref_counts <- ref_seu[['RNA']]$counts
+        ref_cluster <- as.factor(ref_seu@meta.data[[ref_ident_col]])
+        names(ref_cluster) <- colnames(ref_seu)
+        ref_nUMI <- ref_seu@meta.data[[ref_counts_col]]
+        names(ref_nUMI) <- colnames(ref_seu)
+        reference <- Reference(ref_counts, ref_cluster, ref_nUMI)
+        rm(ref_seu, ref_counts, ref_cluster, ref_nUMI) # Clean up memory
+        gc()
+    }, error = function(e) {
+        stop(paste("Error preparing RCTD reference:", e$message))
+    })
+    message("RCTD reference prepared.")
+
+    message("--- Running RCTD (Doublet Mode) ---")
+    tryCatch({
+        # Prepare RCTD Query object
+        query_counts <- seu_obj[[rna_assay]]$counts
+        # Use the already extracted coords tibble
+        query_coords_df <- coords %>% filter(barcode %in% colnames(query_counts)) %>% column_to_rownames("barcode")
+        # Ensure order matches counts
+        query_coords_df <- query_coords_df[colnames(query_counts), ]
+        # Rename columns for SpatialRNA if needed
+        if(all(c("row", "col") %in% colnames(query_coords_df))) {
+            colnames(query_coords_df) <- c("x", "y")
+        } else {
+            stop("Coordinate columns not named 'row'/'col' after processing.")
+        }
+
+        query <- SpatialRNA(query_coords_df, query_counts, colSums(query_counts))
+
+        # Run RCTD
+        RCTD <- create.RCTD(query, reference = reference, max_cores = rctd_cores, CELL_MIN_INSTANCE = 10)
+        RCTD <- run.RCTD(RCTD, doublet_mode = 'doublet')
+
+        # Add results to Seurat object
+        rctd_results_df <- RCTD@results$results_df
+        # Ensure barcodes match before adding metadata
+        common_barcodes_rctd <- intersect(rownames(seu_obj@meta.data), rownames(rctd_results_df))
+        seu_obj <- AddMetaData(seu_obj, metadata = rctd_results_df[common_barcodes_rctd, ], col.name = colnames(rctd_results_df))
+        rm(query, reference, RCTD, rctd_results_df) # Clean up memory
+        gc()
+    }, error = function(e) {
+        warning(paste("Error during RCTD run:", e$message), immediate. = TRUE)
+        # Continue without RCTD results if it fails? Or stop? Currently stops implicitly if AddMetaData fails.
+        # Let's add a check before proceeding to mistyR
+        if (!"first_type" %in% colnames(seu_obj@meta.data)) {
+            stop("RCTD failed or results ('first_type') not added to Seurat object.")
+        }
+    })
+    message("RCTD analysis complete and results added.")
+
+    # --- 3. Save Processed Seurat Object ---
+    seurat_output_path <- file.path(output_dir, paste0(sample_name, "_processed_seu.rds"))
+    message(paste("--- Saving Processed Seurat Object to:", seurat_output_path, "---"))
+    tryCatch({
+        saveRDS(seu_obj, seurat_output_path)
+    }, error = function(e) {
+        warning(paste("Error saving Seurat object:", e$message), immediate. = TRUE)
+    })
+
+    # --- 4. Prepare Data for mistyR ---
+    message("--- Preparing Data for mistyR Analysis ---")
+    mistyR_feature_list <- c() # To store names of features used in mistyR
+
+    # 4.1 Get Coordinates (already have 'coords' tibble)
+    misty_coords_prep <- coords %>% select(barcode, row, col)
+
+    # 4.2 Get Target Gene Expression
+    if (!target_gene %in% rownames(seu_obj[[sct_assay]])) {
+        stop(paste("Target gene '", target_gene, "' not found in the", sct_assay, "assay."))
+    }
+    target_gene_expr <- FetchData(seu_obj, vars = target_gene, assay = sct_assay, layer = 'data') %>%
+      as_tibble(rownames = "barcode")
+    mistyR_feature_list <- c(mistyR_feature_list, target_gene)
+
+    # 4.3 Create Indicator Variables from RCTD results
+    # Check if mapping names exist in the provided list
+    required_map_names <- c("Myeloid", "Arterial_Pos", "Arterial_Neg", "Venous_Pos", "Venous_Neg")
+    if (!all(required_map_names %in% names(cell_type_mapping))) {
+        stop(paste("The 'cell_type_mapping' list is missing one or more required keys:", paste(setdiff(required_map_names, names(cell_type_mapping)), collapse=", ")))
+    }
+    # Check if the mapped values actually exist in RCTD results (optional but good)
+    rctd_types_all <- unique(c(seu_obj$first_type, seu_obj$second_type))
+    mapped_names_exist <- sapply(cell_type_mapping, function(name) name %in% rctd_types_all)
+    if (!all(mapped_names_exist)) {
+         warning(paste("Some cell type names provided in 'cell_type_mapping' were not found in RCTD first_type/second_type results:", paste(names(mapped_names_exist[!mapped_names_exist]), collapse=", ")), immediate. = TRUE)
+    }
+
+    rctd_types_df <- seu_obj@meta.data %>%
+      as_tibble(rownames = "barcode") %>%
+      select(barcode, first_type, second_type)
+
+    cell_type_indicators <- rctd_types_df %>%
+      mutate(
+        is_Myeloid = if_else(first_type == cell_type_mapping$Myeloid | second_type == cell_type_mapping$Myeloid, 1, 0),
+        is_Arterial = if_else(first_type == cell_type_mapping$Arterial_Pos | second_type == cell_type_mapping$Arterial_Pos |
+                              first_type == cell_type_mapping$Arterial_Neg | second_type == cell_type_mapping$Arterial_Neg, 1, 0),
+        is_Venous = if_else(first_type == cell_type_mapping$Venous_Pos | second_type == cell_type_mapping$Venous_Pos |
+                            first_type == cell_type_mapping$Venous_Neg | second_type == cell_type_mapping$Venous_Neg, 1, 0)
+      ) %>%
+      select(barcode, is_Myeloid, is_Arterial, is_Venous)
+    mistyR_feature_list <- c(mistyR_feature_list, "is_Myeloid", "is_Arterial", "is_Venous")
+    message("Summary of mistyR indicator variables:")
+    summary(cell_type_indicators[,-1])
+
+    # 4.4 Combine features for mistyR
+    mistyR_input_data <- inner_join(misty_coords_prep, target_gene_expr, by = "barcode") %>%
+      inner_join(cell_type_indicators, by = "barcode") %>%
+      drop_na() # Remove rows with NAs in any column
+
+    min_spots_misty <- 50 # Minimum spots required
+    if (nrow(mistyR_input_data) < min_spots_misty) {
+        stop(paste("Not enough spots remaining after merging and NA removal for mistyR analysis:", nrow(mistyR_input_data)))
+    } else {
+        message(paste("Number of spots for mistyR analysis:", nrow(mistyR_input_data)))
+    }
+
+    # 4.5 Separate positions and features
+    mistyR_pos <- mistyR_input_data %>% select(row, col)
+    mistyR_expr <- mistyR_input_data %>% select(all_of(mistyR_feature_list)) %>%
+                   mutate(across(everything(), as.numeric)) # Ensure numeric
+
+    # 4.6 Check for zero variance columns
+    if(ncol(mistyR_expr) > 1) {
+        variances <- apply(mistyR_expr, 2, var, na.rm = TRUE)
+        zero_var_cols <- names(variances[variances == 0])
+        if(length(zero_var_cols) > 0) {
+            warning(paste("Removing columns with zero variance for mistyR:", paste(zero_var_cols, collapse=", ")), immediate. = TRUE)
+            mistyR_expr <- mistyR_expr %>% select(-all_of(zero_var_cols))
+        }
+    }
+    if(ncol(mistyR_expr) <= 1) {
+        stop(paste("Not enough features remaining for mistyR after removing zero variance columns:", ncol(mistyR_expr)))
+    }
+    message(paste("Number of features for mistyR after variance check:", ncol(mistyR_expr)))
+    message("Final features for mistyR:")
+    print(colnames(mistyR_expr))
+
+
+    # --- 5. Run Global mistyR Analysis ---
+    message("--- Starting Global mistyR Analysis ---")
+    mistyR_results <- NULL # Initialize
+    tryCatch({
+        # 5.1 Create mistyR views
+        misty.intra <- create_initial_view(mistyR_expr)
+        misty.views <- misty.intra %>%
+          add_paraview(mistyR_pos, l = misty_l_param)
+        message("mistyR views created.")
+        # print(summary(misty.views))
+
+        # 5.2 Run mistyR
+        mistyR_global_folder <- file.path(output_dir, paste0(sample_name, "_mistyR_results"))
+        if (!dir.exists(mistyR_global_folder)) dir.create(mistyR_global_folder)
+        message(paste("Running mistyR, results will be saved in:", mistyR_global_folder))
+        run_misty(misty.views, results.folder = mistyR_global_folder, seed = 123)
+
+        # 5.3 Collect results
+        message("Collecting mistyR results...")
+        misty.results <- collect_results(mistyR_global_folder)
+        message("Global mistyR results collected.")
+        # print(summary(misty.results))
+
+    }, error = function(e) {
+        warning(paste("Error during mistyR analysis:", e$message), immediate. = TRUE)
+        misty.results <<- NULL # Ensure it's NULL if error occurred
+    })
+
+    # --- 6. Generate & Save mistyR Plots ---
+    message("--- Generating mistyR Plots ---")
+    if (!is.null(misty.results)) {
+        plots_saved <- list() # Keep track of saved plots
+
+        # Define plot paths
+        plot_path_contrib <- file.path(output_dir, paste0(sample_name, "_mistyR_contribution.png"))
+        plot_path_intra <- file.path(output_dir, paste0(sample_name, "_mistyR_heatmap_intra.png"))
+        plot_path_para <- file.path(output_dir, paste0(sample_name, "_mistyR_heatmap_para.png"))
+        plot_path_contrast <- file.path(output_dir, paste0(sample_name, "_mistyR_heatmap_contrast.png"))
+
+        # 6.1 Contribution Plot
+        tryCatch({
+            p_contrib_global <- misty.results %>% plot_view_contributions() +
+              labs(title = paste(sample_name, "- mistyR View Contributions"))
+            ggsave(plot_path_contrib, plot = p_contrib_global, width = 6, height = 5, dpi = 300)
+            plots_saved[["contribution"]] <- plot_path_contrib
+            message(paste("Saved contribution plot:", plot_path_contrib))
+        }, error = function(e) { warning(paste("Could not generate/save contribution plot:", e$message), immediate. = TRUE) })
+
+        # 6.2 Interaction Heatmaps (with tryCatch for plotting)
+        para_view_name_global <- paste0("para.", misty_l_param)
+
+        # --- Intraview ---
+        tryCatch({
+            p_heatmap_intra_global <- misty.results %>% plot_interaction_heatmap(view = "intra", cutoff = misty_cutoff_intra)
+            if (inherits(p_heatmap_intra_global, "ggplot")) {
+                p_heatmap_intra_global <- p_heatmap_intra_global +
+                    labs(title = paste(sample_name, "- Intraview (Cutoff=", misty_cutoff_intra, ")")) +
+                    theme(plot.title = element_text(size=10), axis.text.x = element_text(angle = 90, hjust = 1, size=8), axis.text.y = element_text(size=8))
+                ggsave(plot_path_intra, plot = p_heatmap_intra_global, width = 6, height = 5, dpi = 300)
+                plots_saved[["intraview"]] <- plot_path_intra
+                message(paste("Saved intraview heatmap:", plot_path_intra))
+            } else { warning("Intraview plot could not be generated (cutoff too high or other issue?).", immediate. = TRUE) }
+        }, error = function(e) { warning(paste("Error generating/saving intraview heatmap:", e$message), immediate. = TRUE) })
+
+        # --- Paraview ---
+        tryCatch({
+            p_heatmap_para_global <- misty.results %>% plot_interaction_heatmap(view = para_view_name_global, cutoff = misty_cutoff_para)
+            if (inherits(p_heatmap_para_global, "ggplot")) {
+                p_heatmap_para_global <- p_heatmap_para_global +
+                    labs(title = paste(sample_name, "- Paraview (l=", misty_l_param, ", Cutoff=", misty_cutoff_para, ")")) +
+                    theme(plot.title = element_text(size=10), axis.text.x = element_text(angle = 90, hjust = 1, size=8), axis.text.y = element_text(size=8))
+                ggsave(plot_path_para, plot = p_heatmap_para_global, width = 6, height = 5, dpi = 300)
+                plots_saved[["paraview"]] <- plot_path_para
+                message(paste("Saved paraview heatmap:", plot_path_para))
+            } else { warning("Paraview plot could not be generated (cutoff too high or other issue?).", immediate. = TRUE) }
+        }, error = function(e) { warning(paste("Error generating/saving paraview heatmap:", e$message), immediate. = TRUE) })
+
+        # --- Contrast ---
+        tryCatch({
+            p_heatmap_contrast_global <- misty.results %>% plot_contrast_heatmap("intra", para_view_name_global, cutoff = misty_cutoff_para)
+            if (inherits(p_heatmap_contrast_global, "ggplot")) {
+                 p_heatmap_contrast_global <- p_heatmap_contrast_global +
+                    labs(title = paste(sample_name, "- Contrast (Para-Intra, Cutoff=", misty_cutoff_para, ")")) +
+                    theme(plot.title = element_text(size=10), axis.text.x = element_text(angle = 90, hjust = 1, size=8), axis.text.y = element_text(size=8))
+                ggsave(plot_path_contrast, plot = p_heatmap_contrast_global, width = 6, height = 5, dpi = 300)
+                plots_saved[["contrast"]] <- plot_path_contrast
+                message(paste("Saved contrast heatmap:", plot_path_contrast))
+            } else { warning("Contrast plot could not be generated (cutoff too high or other issue?).", immediate. = TRUE) }
+        }, error = function(e) { warning(paste("Error generating/saving contrast heatmap:", e$message), immediate. = TRUE) })
+
+    } else {
+        message("Skipping mistyR plot generation because mistyR analysis failed or produced no results.")
+    }
+
+    # --- 7. Cleanup & Return ---
+    message("--- Cleaning up ---")
+    plan(sequential) # Reset parallel backend
+    gc() # Garbage collection
+
+    message(paste("--- Workflow Complete for Sample:", sample_name, "---"))
+    message(paste("Processed Seurat object saved to:", seurat_output_path))
+    if(length(plots_saved) > 0) {
+        message("mistyR plots saved to:")
+        print(unlist(plots_saved))
+    }
+
+    # Return the path to the saved Seurat object
+    invisible(seurat_output_path)
+}
+
+# --- Example Usage ---
+# # Define your parameters
+# spatial_data_folder <- "FX0028/UA_HUTER_sp_10879894/"
+# reference_rds <- "../sce_sub_for_spatial.rds"
+# results_directory <- "Analysis_Results/FX0028"
+# sample_id <- "FX0028"
+# gene_of_interest <- "RAPGEF3"
+# # IMPORTANT: Verify these names match your reference data's 'updated_celltype' column
+# cell_mapping <- list(
+#     Myeloid = "Immune_Myeloid",
+#     Arterial_Pos = "Arterial_Endo_RAPGEF3+SELP+",
+#     Arterial_Neg = "Arterial_RAPGEF3-_Cells",
+#     Venous_Pos = "Venous_Endo_RAPGEF3+SELP-",
+#     Venous_Neg = "Venous_RAPGEF3-_Cells"
+# )
+#
+# # Run the function
+# saved_rds_path <- run_spatial_analysis(
+#     data_dir = spatial_data_folder,
+#     ref_path = reference_rds,
+#     output_dir = results_directory,
+#     sample_name = sample_id,
+#     target_gene = gene_of_interest,
+#     cell_type_mapping = cell_mapping
+# )
+#
+# if (!is.null(saved_rds_path)) {
+#     print(paste("Analysis successful. Final Seurat object saved at:", saved_rds_path))
+# } else {
+#     print("Analysis encountered errors.")
+# }
+
